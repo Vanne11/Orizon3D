@@ -1,0 +1,6 @@
+/target
+/reference-3DViewer
+Cargo.lock
+
+# SDK oficial (~94 MB): se baja con scripts/fetch-sdk.sh
+/vendor/3DCamera/lib/lib3DCamera.so
