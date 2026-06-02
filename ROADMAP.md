@@ -24,13 +24,15 @@ Leyenda: ✅ hecho · 🚧 en curso · ⬜ pendiente
 - [x] Script de instalación de reglas udev (`scripts/install-udev.sh`).
 - [x] Compila, enlaza y arranca sin escáner (muestra estado); pendiente prueba con hardware real.
 
-## Fase 2 — Stream RGB + vista emparejada 🚧
+## Fase 2 — Stream RGB + vista emparejada ✅
 
-- [ ] Arrancar el stream RGB además del de profundidad.
-- [ ] Usar `cameraGetPairedFrame` para obtener depth+RGB sincronizados.
-- [ ] Decodificar el formato RGB (MJPG / H264 / RGB8) a imagen mostrable.
-- [ ] GUI: vista lado a lado (profundidad | RGB), selector de stream.
-- [ ] Manejar cámaras sin sensor RGB (MINI sin RGB) con elegancia.
+- [x] Arrancar el stream RGB además del de profundidad.
+- [x] Usar `cameraGetPairedFrame` para obtener depth+RGB sincronizados.
+- [x] Decodificar el formato RGB: RGB8 (directo) y MJPG (zune-jpeg). H264 ⬜ pendiente.
+- [x] GUI: vista lado a lado (profundidad | RGB).
+- [x] Manejar cámaras sin sensor RGB con elegancia (sigue solo con profundidad).
+- [ ] Selector de formato/resolución de stream en la GUI (ahora se auto-elige).
+- [ ] Soporte de RGB en H264.
 
 ## Fase 3 — Nube de puntos + exportar ⬜
 

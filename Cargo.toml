@@ -15,6 +15,8 @@ egui = "0.29"
 crossbeam-channel = "0.5"
 log = "0.4"
 env_logger = "0.11"
+# Decodificador JPEG en Rust puro para el stream RGB en formato MJPG.
+zune-jpeg = "0.4"
 
 [profile.release]
 opt-level = 3

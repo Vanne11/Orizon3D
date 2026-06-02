@@ -10,7 +10,7 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 
-use crate::sdk::{ffi::StreamInfo, CameraDescription, DepthFrame, Session};
+use crate::sdk::{ffi::StreamInfo, CameraDescription, Frames, Session};
 
 /// Estado del pipeline de captura, para mostrarlo en la UI.
 #[derive(Debug, Clone)]
@@ -18,7 +18,8 @@ pub enum Status {
     Connecting,
     Streaming {
         info: CameraDescription,
-        stream: StreamInfo,
+        depth: StreamInfo,
+        rgb: Option<StreamInfo>,
     },
     Error(String),
     Stopped,
@@ -26,21 +27,20 @@ pub enum Status {
 
 /// Maneja el hilo de captura y expone los canales de frames y estado.
 pub struct Capture {
-    pub frames: Receiver<DepthFrame>,
+    pub frames: Receiver<Frames>,
     pub status: Receiver<Status>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
 impl Capture {
-    /// Arranca el hilo de captura. Se conecta e inicia el stream dentro del hilo.
-    /// `wake` se invoca cada vez que llega un frame para refrescar la GUI.
+    /// Arranca el hilo de captura. Se conecta e inicia los streams dentro del
+    /// hilo. `wake` se invoca con cada frame para refrescar la GUI.
     pub fn start<F>(wake: F) -> Self
     where
         F: Fn() + Send + 'static,
     {
-        // Canal de frames acotado: nos quedamos siempre con lo más reciente.
-        let (frame_tx, frame_rx) = bounded::<DepthFrame>(2);
+        let (frame_tx, frame_rx) = bounded::<Frames>(2);
         let (status_tx, status_rx) = unbounded::<Status>();
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -70,7 +70,7 @@ impl Drop for Capture {
 
 fn capture_loop<F>(
     stop: Arc<AtomicBool>,
-    frame_tx: Sender<DepthFrame>,
+    frame_tx: Sender<Frames>,
     status_tx: Sender<Status>,
     wake: F,
 ) where
@@ -82,7 +82,8 @@ fn capture_loop<F>(
         Ok(s) => {
             let _ = status_tx.send(Status::Streaming {
                 info: s.info.clone(),
-                stream: s.stream_info,
+                depth: s.depth_info,
+                rgb: s.rgb_info,
             });
             s
         }
@@ -93,12 +94,11 @@ fn capture_loop<F>(
     };
 
     while !stop.load(Ordering::SeqCst) {
-        match session.poll_depth(1000) {
-            Ok(Some(frame)) => {
+        match session.poll(1000) {
+            Ok(Some(frames)) => {
                 // Buffer acotado: si está lleno descartamos este frame para no
-                // acumular latencia (preview en tiempo real). La GUI siempre
-                // se queda con el más reciente que haya disponible.
-                let _ = frame_tx.try_send(frame);
+                // acumular latencia (la GUI siempre toma el más reciente).
+                let _ = frame_tx.try_send(frames);
                 wake();
             }
             Ok(None) => { /* timeout: seguimos esperando */ }
@@ -110,5 +110,5 @@ fn capture_loop<F>(
     }
 
     let _ = status_tx.send(Status::Stopped);
-    // `session` se destruye aquí: para el stream, desconecta y libera el sistema.
+    // `session` se destruye aquí: para los streams, desconecta y libera todo.
 }

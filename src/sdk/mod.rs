@@ -1,12 +1,12 @@
 //! Envoltura segura sobre el SDK oficial `lib3DCamera.so`.
 //!
-//! Toda una sesión (sistema → cámara → stream) vive dentro de un único hilo
+//! Toda una sesión (sistema → cámara → streams) vive dentro de un único hilo
 //! de captura, por lo que no hace falta compartir los punteros crudos entre
 //! hilos. `Session` libera todos los recursos automáticamente al destruirse.
 
 pub mod ffi;
 
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_int};
 use std::ptr;
 
 /// Error genérico del SDK.
@@ -41,25 +41,41 @@ pub struct DepthFrame {
     pub timestamp_ms: f64,
 }
 
+/// Un frame RGB ya decodificado a RGB8 entrelazado (R,G,B por píxel).
+pub struct RgbFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgb: Vec<u8>,
+}
+
+/// Conjunto de frames emparejados que entrega la captura a la GUI.
+pub struct Frames {
+    pub depth: DepthFrame,
+    pub rgb: Option<RgbFrame>,
+}
+
 fn cstr_to_string(buf: &[c_char]) -> String {
-    // Reinterpretamos como bytes y cortamos en el primer NUL.
     let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len()) };
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-/// Sesión completa con un escáner: sistema + cámara + stream de profundidad.
+/// Sesión completa con un escáner: sistema + cámara + streams (profundidad y,
+/// opcionalmente, RGB).
 pub struct Session {
     sys: *mut ffi::CSystem,
     camera: *mut ffi::CCamera,
-    stream: *mut ffi::CStream,
+    depth_stream: *mut ffi::CStream,
+    /// NULL si la cámara no tiene sensor RGB (p. ej. MINI sin RGB).
+    rgb_stream: *mut ffi::CStream,
     pub info: CameraDescription,
-    pub stream_info: ffi::StreamInfo,
+    pub depth_info: ffi::StreamInfo,
+    pub rgb_info: Option<ffi::StreamInfo>,
 }
 
 impl Session {
     /// Crea el sistema, enumera escáneres, conecta el primero y arranca el
-    /// stream de profundidad. Devuelve error si no hay ningún escáner.
+    /// stream de profundidad (y el RGB si está disponible).
     pub fn open() -> Result<Session> {
         unsafe {
             let sys = ffi::createSystem();
@@ -84,7 +100,7 @@ impl Session {
 
             // 2) Tomar la primera cámara de la lista.
             let infos = std::slice::from_raw_parts(list, count as usize);
-            let mut chosen = infos[0]; // copia propia; el SDK casa por serial/uniqueId
+            let mut chosen = infos[0];
             let info = CameraDescription {
                 name: cstr_to_string(&chosen.name),
                 serial: cstr_to_string(&chosen.serial),
@@ -101,8 +117,8 @@ impl Session {
                 )));
             }
 
-            // 3) Elegir un formato de stream de profundidad y arrancarlo.
-            let stream_info = match Self::pick_depth_stream(camera) {
+            // 3) Arrancar el stream de profundidad.
+            let depth_info = match Self::pick_depth_stream(camera) {
                 Some(si) => si,
                 None => {
                     ffi::systemDisconnectCamera(sys, camera);
@@ -112,36 +128,73 @@ impl Session {
                     ));
                 }
             };
-
-            // Callback NULL → consumimos los frames por polling (igual que 3DViewer).
-            let stream = ffi::cameraStartStream(
+            let depth_stream = ffi::cameraStartStream(
                 camera,
                 ffi::STREAM_TYPE_DEPTH,
-                stream_info,
+                depth_info,
                 None,
                 ptr::null_mut(),
             );
-            if stream.is_null() {
+            if depth_stream.is_null() {
                 ffi::systemDisconnectCamera(sys, camera);
                 ffi::deleteSystem(sys);
-                return Err(SdkError("cameraStartStream() falló".into()));
+                return Err(SdkError("cameraStartStream(DEPTH) falló".into()));
+            }
+
+            // 4) Arrancar el stream RGB si hay un formato que sepamos decodificar.
+            let rgb_info = Self::pick_rgb_stream(camera);
+            let mut rgb_stream: *mut ffi::CStream = ptr::null_mut();
+            if let Some(rinfo) = rgb_info {
+                rgb_stream = ffi::cameraStartStream(
+                    camera,
+                    ffi::STREAM_TYPE_RGB,
+                    rinfo,
+                    None,
+                    ptr::null_mut(),
+                );
+                if rgb_stream.is_null() {
+                    log::warn!("No se pudo arrancar el stream RGB; sigo solo con profundidad");
+                }
             }
 
             Ok(Session {
                 sys,
                 camera,
-                stream,
+                depth_stream,
+                rgb_stream,
                 info,
-                stream_info,
+                depth_info,
+                rgb_info: if rgb_stream.is_null() { None } else { rgb_info },
             })
         }
     }
 
-    /// Selecciona el mejor `StreamInfo` de profundidad: preferimos Z16, luego
-    /// Z16Y8Y8, y en su defecto el primero disponible.
+    /// Mejor `StreamInfo` de profundidad: preferimos Z16, luego Z16Y8Y8.
     unsafe fn pick_depth_stream(camera: *mut ffi::CCamera) -> Option<ffi::StreamInfo> {
+        Self::pick_stream(camera, ffi::STREAM_TYPE_DEPTH, &[
+            ffi::STREAM_FORMAT_Z16,
+            ffi::STREAM_FORMAT_Z16Y8Y8,
+        ])
+    }
+
+    /// Mejor `StreamInfo` de RGB: preferimos RGB8 (sin decodificar), luego MJPG.
+    /// H264 no se soporta aún, así que si solo hay eso devolvemos `None`.
+    unsafe fn pick_rgb_stream(camera: *mut ffi::CCamera) -> Option<ffi::StreamInfo> {
+        Self::pick_stream(camera, ffi::STREAM_TYPE_RGB, &[
+            ffi::STREAM_FORMAT_RGB8,
+            ffi::STREAM_FORMAT_MJPG,
+        ])
+    }
+
+    /// Devuelve el primer `StreamInfo` cuyo formato esté en `preferred`
+    /// (en orden de preferencia). Si ninguno coincide, devuelve `None`.
+    unsafe fn pick_stream(
+        camera: *mut ffi::CCamera,
+        stype: ffi::STREAM_TYPE,
+        preferred: &[ffi::STREAM_FORMAT],
+    ) -> Option<ffi::StreamInfo> {
         let mut count: c_int = 0;
-        let list = ffi::cameraCreateStreamInfoList(camera, ffi::STREAM_TYPE_DEPTH, &mut count);
+        let list = ffi::cameraCreateStreamInfoList(camera, stype, &mut count);
         if list.is_null() || count <= 0 {
             if !list.is_null() {
                 ffi::cameraDeleteStreamInfoList(list);
@@ -150,58 +203,182 @@ impl Session {
         }
         let infos = std::slice::from_raw_parts(list, count as usize);
 
-        let pick = |fmt: ffi::STREAM_FORMAT| infos.iter().find(|i| i.format == fmt).copied();
-        let chosen = pick(ffi::STREAM_FORMAT_Z16)
-            .or_else(|| pick(ffi::STREAM_FORMAT_Z16Y8Y8))
-            .unwrap_or(infos[0]);
+        let mut chosen = None;
+        for &fmt in preferred {
+            if let Some(found) = infos.iter().find(|i| i.format == fmt) {
+                // Entre varias resoluciones del mismo formato, la mayor.
+                let best = infos
+                    .iter()
+                    .filter(|i| i.format == fmt)
+                    .max_by_key(|i| i.width * i.height)
+                    .unwrap_or(found);
+                chosen = Some(*best);
+                break;
+            }
+        }
 
         ffi::cameraDeleteStreamInfoList(list);
-        Some(chosen)
+        chosen
     }
 
-    /// Obtiene (por polling) el siguiente frame de profundidad.
+    /// Obtiene (por polling) el siguiente conjunto de frames.
     /// `Ok(None)` significa timeout / no hay frame todavía.
-    pub fn poll_depth(&mut self, timeout_ms: i32) -> Result<Option<DepthFrame>> {
+    pub fn poll(&mut self, timeout_ms: i32) -> Result<Option<Frames>> {
         unsafe {
-            let mut frame: *mut ffi::CFrame = ptr::null_mut();
-            let rc = ffi::cameraGetFrame(self.stream, &mut frame, timeout_ms);
-
-            if rc == ffi::ERROR_FRAME_TIMEOUT || (rc == ffi::SUCCESS && frame.is_null()) {
-                return Ok(None);
-            }
-            if rc != ffi::SUCCESS {
-                if !frame.is_null() {
-                    ffi::cameraReleaseFrame(self.stream, frame);
+            if self.rgb_stream.is_null() {
+                // Solo profundidad.
+                let mut frame: *mut ffi::CFrame = ptr::null_mut();
+                let rc = ffi::cameraGetFrame(self.depth_stream, &mut frame, timeout_ms);
+                match self.check_rc(rc, frame, self.depth_stream)? {
+                    None => Ok(None),
+                    Some(()) => {
+                        let depth = self.extract_depth(frame);
+                        ffi::cameraReleaseFrame(self.depth_stream, frame);
+                        Ok(Some(Frames { depth, rgb: None }))
+                    }
                 }
-                return Err(SdkError(format!("cameraGetFrame() error (código {rc})")));
+            } else {
+                // Frames emparejados depth + RGB.
+                let mut dframe: *mut ffi::CFrame = ptr::null_mut();
+                let mut rframe: *mut ffi::CFrame = ptr::null_mut();
+                let rc = ffi::cameraGetPairedFrame(
+                    self.depth_stream,
+                    &mut dframe,
+                    &mut rframe,
+                    timeout_ms,
+                );
+                if rc == ffi::ERROR_FRAME_TIMEOUT {
+                    return Ok(None);
+                }
+                if rc != ffi::SUCCESS {
+                    if !dframe.is_null() {
+                        ffi::cameraReleaseFrame(self.depth_stream, dframe);
+                    }
+                    if !rframe.is_null() {
+                        ffi::cameraReleaseFrame(self.rgb_stream, rframe);
+                    }
+                    return Err(SdkError(format!(
+                        "cameraGetPairedFrame() error (código {rc})"
+                    )));
+                }
+
+                let depth = self.extract_depth(dframe);
+                let rgb = if rframe.is_null() {
+                    None
+                } else {
+                    extract_rgb(rframe)
+                };
+
+                if !dframe.is_null() {
+                    ffi::cameraReleaseFrame(self.depth_stream, dframe);
+                }
+                if !rframe.is_null() {
+                    ffi::cameraReleaseFrame(self.rgb_stream, rframe);
+                }
+                Ok(Some(Frames { depth, rgb }))
             }
+        }
+    }
 
-            let width = ffi::frameGetWidth(frame).max(0) as u32;
-            let height = ffi::frameGetHeight(frame).max(0) as u32;
-            let timestamp_ms = ffi::frameGetTimestamp(frame);
-
-            // El plano de profundidad Z16 es válido tanto para formato Z16 como
-            // para el compuesto Z16Y8Y8.
-            let mut data_ptr = ffi::frameGetDataByFormat(frame, ffi::FRAME_DATA_FORMAT_Z16);
-            if data_ptr.is_null() {
-                data_ptr = ffi::frameGetData(frame);
+    /// Traduce el código de retorno de un get a `Ok(None)` (timeout) /
+    /// `Ok(Some(()))` (hay frame) / `Err`. Libera el frame si hubo error.
+    unsafe fn check_rc(
+        &self,
+        rc: ffi::ERROR_CODE,
+        frame: *mut ffi::CFrame,
+        stream: *mut ffi::CStream,
+    ) -> Result<Option<()>> {
+        if rc == ffi::ERROR_FRAME_TIMEOUT || (rc == ffi::SUCCESS && frame.is_null()) {
+            return Ok(None);
+        }
+        if rc != ffi::SUCCESS {
+            if !frame.is_null() {
+                ffi::cameraReleaseFrame(stream, frame);
             }
+            return Err(SdkError(format!("cameraGetFrame() error (código {rc})")));
+        }
+        Ok(Some(()))
+    }
 
-            let mut depth = Vec::new();
-            if !data_ptr.is_null() && width > 0 && height > 0 {
-                let n = (width * height) as usize;
-                let src = std::slice::from_raw_parts(data_ptr as *const u16, n);
-                depth.extend_from_slice(src);
+    unsafe fn extract_depth(&self, frame: *mut ffi::CFrame) -> DepthFrame {
+        let width = ffi::frameGetWidth(frame).max(0) as u32;
+        let height = ffi::frameGetHeight(frame).max(0) as u32;
+        let timestamp_ms = ffi::frameGetTimestamp(frame);
+
+        let mut data_ptr = ffi::frameGetDataByFormat(frame, ffi::FRAME_DATA_FORMAT_Z16);
+        if data_ptr.is_null() {
+            data_ptr = ffi::frameGetData(frame);
+        }
+
+        let mut depth = Vec::new();
+        if !data_ptr.is_null() && width > 0 && height > 0 {
+            let n = (width * height) as usize;
+            let src = std::slice::from_raw_parts(data_ptr as *const u16, n);
+            depth.extend_from_slice(src);
+        }
+
+        DepthFrame {
+            width,
+            height,
+            depth,
+            timestamp_ms,
+        }
+    }
+}
+
+/// Extrae y decodifica un frame RGB a RGB8 entrelazado.
+unsafe fn extract_rgb(frame: *mut ffi::CFrame) -> Option<RgbFrame> {
+    let width = ffi::frameGetWidth(frame).max(0) as u32;
+    let height = ffi::frameGetHeight(frame).max(0) as u32;
+    let format = ffi::frameGetFormat(frame);
+    let size = ffi::frameGetDataSize(frame).max(0) as usize;
+    let data_ptr = ffi::frameGetData(frame);
+    if data_ptr.is_null() || size == 0 {
+        return None;
+    }
+    let bytes = std::slice::from_raw_parts(data_ptr as *const u8, size);
+
+    match format {
+        // Datos ya en RGB (orden R,G,B), igual que QImage::Format_RGB888.
+        ffi::STREAM_FORMAT_RGB8 => {
+            let need = (width * height * 3) as usize;
+            if width == 0 || height == 0 || bytes.len() < need {
+                return None;
             }
-
-            ffi::cameraReleaseFrame(self.stream, frame);
-
-            Ok(Some(DepthFrame {
+            Some(RgbFrame {
                 width,
                 height,
-                depth,
-                timestamp_ms,
-            }))
+                rgb: bytes[..need].to_vec(),
+            })
+        }
+        // JPEG comprimido: lo decodificamos a RGB8.
+        ffi::STREAM_FORMAT_MJPG => decode_mjpg(bytes),
+        other => {
+            log::warn!("Formato RGB no soportado todavía: {other} (p. ej. H264)");
+            None
+        }
+    }
+}
+
+/// Decodifica un buffer MJPG/JPEG a `RgbFrame` (RGB8) usando zune-jpeg.
+fn decode_mjpg(bytes: &[u8]) -> Option<RgbFrame> {
+    use zune_jpeg::JpegDecoder;
+    let mut decoder = JpegDecoder::new(bytes);
+    match decoder.decode() {
+        Ok(pixels) => {
+            let (w, h) = decoder.dimensions().unwrap_or((0, 0));
+            if w == 0 || h == 0 || pixels.len() < w * h * 3 {
+                return None;
+            }
+            Some(RgbFrame {
+                width: w as u32,
+                height: h as u32,
+                rgb: pixels,
+            })
+        }
+        Err(e) => {
+            log::warn!("Fallo al decodificar JPEG del stream RGB: {e:?}");
+            None
         }
     }
 }
@@ -209,8 +386,11 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         unsafe {
-            if !self.stream.is_null() {
-                ffi::cameraStopStream(self.stream);
+            if !self.rgb_stream.is_null() {
+                ffi::cameraStopStream(self.rgb_stream);
+            }
+            if !self.depth_stream.is_null() {
+                ffi::cameraStopStream(self.depth_stream);
             }
             if !self.camera.is_null() {
                 ffi::systemDisconnectCamera(self.sys, self.camera);
@@ -221,7 +401,3 @@ impl Drop for Session {
         }
     }
 }
-
-// Helpers de conversión de void* sin usar (silencia el warning del import).
-#[allow(dead_code)]
-fn _unused(_: *mut c_void) {}
