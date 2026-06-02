@@ -34,13 +34,15 @@ Leyenda: ✅ hecho · 🚧 en curso · ⬜ pendiente
 - [ ] Selector de formato/resolución de stream en la GUI (ahora se auto-elige).
 - [ ] Soporte de RGB en H264.
 
-## Fase 3 — Nube de puntos + exportar ⬜
+## Fase 3 — Nube de puntos + exportar ✅
 
-- [ ] Leer intrínsecos/extrínsecos del SDK (`cameraGetStreamIntrinsics`, `...Extrinsics`).
-- [ ] Generar nube de puntos desde el mapa de profundidad (deproyección).
-- [ ] Visor 3D de la nube (cámara orbital) en la GUI.
-- [ ] Colorear puntos con el frame RGB (mapeo depth→RGB con extrínsecos).
-- [ ] Exportar a **PLY** (un frame).
+- [x] Leer intrínsecos/extrínsecos del SDK (`cameraGetStreamIntrinsics`, `...Extrinsics`).
+- [x] Generar nube de puntos desde el mapa de profundidad (deproyección).
+- [x] Visor 3D de la nube (cámara orbital por software) en la GUI.
+- [x] Colorear puntos con el frame RGB (mapeo depth→RGB con extrínsecos).
+- [x] Exportar a **PLY** (un frame) a `captures/`.
+- [x] Tests unitarios de la deproyección y del export PLY.
+- [ ] Export PLY binario (ahora ASCII) y filtros de profundidad (ruido/relleno).
 
 ## Fase 4 — Captura multi-frame y registro ⬜
 

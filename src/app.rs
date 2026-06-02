@@ -1,10 +1,12 @@
-//! Interfaz gráfica (egui/eframe): visor en vivo de los streams.
+//! Interfaz gráfica (egui/eframe): visor de streams + nube de puntos.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use eframe::egui;
 
 use crate::capture::{Capture, Status};
+use crate::pointcloud::{self, CloudParams, OrbitCamera, PointCloud};
 use crate::sdk::{CameraDescription, Frames};
 
 pub struct RevoApp {
@@ -16,8 +18,22 @@ pub struct RevoApp {
     status: String,
     info: Option<CameraDescription>,
     stream_desc: String,
-    has_rgb: bool,
-    // Métricas de FPS de visualización.
+
+    // Calibración + último frame, para generar la nube.
+    params: Option<CloudParams>,
+    last_frames: Option<Frames>,
+
+    // Vista 3D.
+    show_3d: bool,
+    cloud: Option<PointCloud>,
+    cloud_dirty: bool,
+    cloud_tex: Option<egui::TextureHandle>,
+    camera: OrbitCamera,
+
+    // Guardado.
+    save_msg: String,
+
+    // FPS de visualización.
     frame_count: u32,
     last_fps_instant: Instant,
     fps: f32,
@@ -34,7 +50,14 @@ impl RevoApp {
             status: "Inicializando…".to_owned(),
             info: None,
             stream_desc: String::new(),
-            has_rgb: false,
+            params: None,
+            last_frames: None,
+            show_3d: false,
+            cloud: None,
+            cloud_dirty: false,
+            cloud_tex: None,
+            camera: OrbitCamera::default(),
+            save_msg: String::new(),
             frame_count: 0,
             last_fps_instant: Instant::now(),
             fps: 0.0,
@@ -43,13 +66,14 @@ impl RevoApp {
         app
     }
 
-    /// Arranca (o reinicia) el hilo de captura.
     fn connect(&mut self, ctx: &egui::Context) {
-        self.capture = None; // detiene el hilo anterior (Drop)
+        self.capture = None;
         self.depth_tex = None;
         self.rgb_tex = None;
         self.info = None;
-        self.has_rgb = false;
+        self.params = None;
+        self.last_frames = None;
+        self.cloud = None;
         self.stream_desc.clear();
         self.status = "Conectando…".to_owned();
 
@@ -62,9 +86,13 @@ impl RevoApp {
         while let Ok(s) = cap.status.try_recv() {
             match s {
                 Status::Connecting => self.status = "Conectando con el escáner…".to_owned(),
-                Status::Streaming { info, depth, rgb } => {
+                Status::Streaming {
+                    info,
+                    depth,
+                    rgb,
+                    params,
+                } => {
                     self.status = "Transmitiendo".to_owned();
-                    self.has_rgb = rgb.is_some();
                     let mut d = format!(
                         "Profundidad {}×{} @ {:.0} fps",
                         depth.width, depth.height, depth.fps
@@ -72,15 +100,13 @@ impl RevoApp {
                     match rgb {
                         Some(r) => {
                             let fmt = if r.format == 1 { "RGB8" } else { "MJPG" };
-                            d.push_str(&format!(
-                                "   ·   RGB {}×{} ({})",
-                                r.width, r.height, fmt
-                            ));
+                            d.push_str(&format!("   ·   RGB {}×{} ({})", r.width, r.height, fmt));
                         }
                         None => d.push_str("   ·   sin RGB"),
                     }
                     self.stream_desc = d;
                     self.info = Some(info);
+                    self.params = Some(params);
                 }
                 Status::Error(e) => self.status = format!("Error: {e}"),
                 Status::Stopped => self.status = "Detenido".to_owned(),
@@ -99,6 +125,8 @@ impl RevoApp {
             if let Some(rgb) = &frames.rgb {
                 self.update_rgb(ctx, rgb.width as usize, rgb.height as usize, &rgb.rgb);
             }
+            self.last_frames = Some(frames);
+            self.cloud_dirty = true;
             self.tick_fps();
         }
     }
@@ -143,6 +171,56 @@ impl RevoApp {
             }
         }
     }
+
+    /// Genera (o regenera) la nube a partir del último frame.
+    fn rebuild_cloud(&mut self) {
+        let (Some(params), Some(frames)) = (&self.params, &self.last_frames) else {
+            return;
+        };
+        let cloud = PointCloud::generate(&frames.depth, frames.rgb.as_ref(), params);
+        self.cloud = Some(cloud);
+        self.cloud_dirty = false;
+    }
+
+    /// Guarda la nube del último frame como PLY en `captures/`.
+    fn save_ply(&mut self) {
+        if self.params.is_none() || self.last_frames.is_none() {
+            self.save_msg = "No hay frame para guardar todavía.".to_owned();
+            return;
+        }
+        self.rebuild_cloud();
+        let Some(cloud) = &self.cloud else { return };
+        if cloud.points.is_empty() {
+            self.save_msg = "La nube está vacía (sin datos de profundidad).".to_owned();
+            return;
+        }
+
+        let dir = PathBuf::from("captures");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.save_msg = format!("No se pudo crear captures/: {e}");
+            return;
+        }
+        // Buscar el primer nombre libre.
+        let mut path = dir.join("cloud_000.ply");
+        for n in 0..1000 {
+            let candidate = dir.join(format!("cloud_{n:03}.ply"));
+            if !candidate.exists() {
+                path = candidate;
+                break;
+            }
+        }
+        match cloud.export_ply(&path) {
+            Ok(()) => {
+                self.save_msg = format!(
+                    "Guardado {} ({} puntos{})",
+                    path.display(),
+                    cloud.points.len(),
+                    if cloud.has_color { ", con color" } else { "" }
+                );
+            }
+            Err(e) => self.save_msg = format!("Error al guardar: {e}"),
+        }
+    }
 }
 
 impl eframe::App for RevoApp {
@@ -175,43 +253,116 @@ impl eframe::App for RevoApp {
                 if !self.stream_desc.is_empty() {
                     ui.label(&self.stream_desc);
                 }
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.show_3d, "Vista 3D (nube)");
+                    if ui.button("💾 Guardar PLY").clicked() {
+                        self.save_ply();
+                    }
+                    if self.show_3d {
+                        if ui.button("Reset vista").clicked() {
+                            self.camera = OrbitCamera::default();
+                        }
+                        ui.label("· arrastra para rotar, rueda para zoom");
+                    }
+                });
+                if !self.save_msg.is_empty() {
+                    ui.label(&self.save_msg);
+                }
             }
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let has_depth = self.depth_tex.is_some();
-            let has_rgb = self.rgb_tex.is_some();
-
-            if !has_depth && !has_rgb {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        "Esperando frames…\n\nConecta el escáner Revopoint por USB.",
-                    );
-                });
-                ctx.request_repaint_after(std::time::Duration::from_millis(33));
-                return;
-            }
-
-            if has_rgb {
-                // Dos columnas: profundidad | color.
-                ui.columns(2, |cols| {
-                    cols[0].vertical_centered(|ui| {
-                        ui.label("Profundidad");
-                        image_fit(ui, self.depth_tex.as_ref(), self.depth_size);
-                    });
-                    cols[1].vertical_centered(|ui| {
-                        ui.label("RGB");
-                        image_fit(ui, self.rgb_tex.as_ref(), self.rgb_size);
-                    });
-                });
+            if self.show_3d {
+                self.show_cloud_view(ui, ctx);
             } else {
-                ui.centered_and_justified(|ui| {
-                    image_fit(ui, self.depth_tex.as_ref(), self.depth_size);
-                });
+                self.show_2d_view(ui);
             }
         });
 
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    }
+}
+
+impl RevoApp {
+    fn show_2d_view(&mut self, ui: &mut egui::Ui) {
+        let has_depth = self.depth_tex.is_some();
+        let has_rgb = self.rgb_tex.is_some();
+
+        if !has_depth && !has_rgb {
+            ui.centered_and_justified(|ui| {
+                ui.label("Esperando frames…\n\nConecta el escáner Revopoint por USB.");
+            });
+            return;
+        }
+        if has_rgb {
+            ui.columns(2, |cols| {
+                cols[0].vertical_centered(|ui| {
+                    ui.label("Profundidad");
+                    image_fit(ui, self.depth_tex.as_ref(), self.depth_size);
+                });
+                cols[1].vertical_centered(|ui| {
+                    ui.label("RGB");
+                    image_fit(ui, self.rgb_tex.as_ref(), self.rgb_size);
+                });
+            });
+        } else {
+            ui.centered_and_justified(|ui| {
+                image_fit(ui, self.depth_tex.as_ref(), self.depth_size);
+            });
+        }
+    }
+
+    fn show_cloud_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.cloud_dirty || self.cloud.is_none() {
+            self.rebuild_cloud();
+        }
+        let Some(cloud) = &self.cloud else {
+            ui.centered_and_justified(|ui| ui.label("Sin nube todavía."));
+            return;
+        };
+        if cloud.points.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("Nube vacía: aún no llegan datos de profundidad válidos.")
+            });
+            return;
+        }
+
+        // Área interactiva.
+        let avail = ui.available_size();
+        let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::drag());
+
+        if resp.dragged() {
+            let d = resp.drag_delta();
+            self.camera.yaw -= d.x * 0.01;
+            self.camera.pitch = (self.camera.pitch + d.y * 0.01).clamp(-1.5, 1.5);
+        }
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            if scroll != 0.0 {
+                self.camera.zoom = (self.camera.zoom * (1.0 + scroll * 0.0015)).clamp(0.1, 10.0);
+            }
+        }
+
+        // Rasterizar a un buffer del tamaño del área (limitado).
+        let w = (rect.width() as usize).clamp(16, 1280);
+        let h = (rect.height() as usize).clamp(16, 1024);
+        let buf = pointcloud::render(cloud, self.camera, w, h);
+        let image = egui::ColorImage::from_rgb([w, h], &buf);
+        match &mut self.cloud_tex {
+            Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
+            None => {
+                self.cloud_tex =
+                    Some(ctx.load_texture("cloud", image, egui::TextureOptions::LINEAR));
+            }
+        }
+        if let Some(tex) = &self.cloud_tex {
+            ui.painter().image(
+                tex.id(),
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
     }
 }
 

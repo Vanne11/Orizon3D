@@ -59,6 +59,33 @@ pub struct StreamInfo {
     pub fps: f32,
 }
 
+/// `Intrinsics` de `Types.hpp`: resolución de calibración + matriz 3x3.
+/// Los campos `zero*`/`one22` son los ceros/uno de la matriz; solo usamos
+/// fx, fy, cx, cy.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Intrinsics {
+    pub width: i16,
+    pub height: i16,
+    pub fx: f32,
+    pub zero01: f32,
+    pub cx: f32,
+    pub zeor10: f32,
+    pub fy: f32,
+    pub cy: f32,
+    pub zeor20: f32,
+    pub zero21: f32,
+    pub one22: f32,
+}
+
+/// `Extrinsics` de `Types.hpp`: rotación 3x3 (column-major) + traslación.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Extrinsics {
+    pub rotation: [f32; 9],
+    pub translation: [f32; 3],
+}
+
 /// `CameraInfo` de `Types.hpp`: cinco buffers de char de tamaño fijo.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -108,6 +135,12 @@ extern "C" {
         timeout_ms: c_int,
     ) -> ERROR_CODE;
     pub fn cameraReleaseFrame(sp: *mut CStream, frame: *mut CFrame) -> ERROR_CODE;
+    pub fn cameraGetStreamIntrinsics(
+        device: *const CCamera,
+        type_: STREAM_TYPE,
+        intr: *mut Intrinsics,
+    ) -> ERROR_CODE;
+    pub fn cameraGetStreamExtrinsics(device: *const CCamera, extr: *mut Extrinsics) -> ERROR_CODE;
 
     // -- frame.h --
     pub fn frameGetTimestamp(frame: *const CFrame) -> f64;

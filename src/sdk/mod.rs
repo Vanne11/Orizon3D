@@ -71,6 +71,12 @@ pub struct Session {
     pub info: CameraDescription,
     pub depth_info: ffi::StreamInfo,
     pub rgb_info: Option<ffi::StreamInfo>,
+    pub depth_intr: ffi::Intrinsics,
+    pub rgb_intr: Option<ffi::Intrinsics>,
+    pub extrinsics: ffi::Extrinsics,
+    /// Escala de profundidad: profundidad_mm = depth_scale · valor. Para la
+    /// serie POP el valor por defecto del SDK es 0.1 (igual que 3DViewer).
+    pub depth_scale: f32,
 }
 
 impl Session {
@@ -157,6 +163,28 @@ impl Session {
                 }
             }
 
+            // 5) Leer parámetros de calibración (intrínsecos/extrínsecos).
+            let mut depth_intr = ffi::Intrinsics::default();
+            if ffi::cameraGetStreamIntrinsics(camera, ffi::STREAM_TYPE_DEPTH, &mut depth_intr)
+                != ffi::SUCCESS
+            {
+                log::warn!("No se pudieron leer los intrínsecos de profundidad");
+            }
+            let rgb_intr = if !rgb_stream.is_null() {
+                let mut ri = ffi::Intrinsics::default();
+                if ffi::cameraGetStreamIntrinsics(camera, ffi::STREAM_TYPE_RGB, &mut ri)
+                    == ffi::SUCCESS
+                {
+                    Some(ri)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let mut extrinsics = ffi::Extrinsics::default();
+            let _ = ffi::cameraGetStreamExtrinsics(camera, &mut extrinsics);
+
             Ok(Session {
                 sys,
                 camera,
@@ -165,6 +193,10 @@ impl Session {
                 info,
                 depth_info,
                 rgb_info: if rgb_stream.is_null() { None } else { rgb_info },
+                depth_intr,
+                rgb_intr,
+                extrinsics,
+                depth_scale: 0.1,
             })
         }
     }

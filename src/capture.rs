@@ -10,6 +10,7 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 
+use crate::pointcloud::CloudParams;
 use crate::sdk::{ffi::StreamInfo, CameraDescription, Frames, Session};
 
 /// Estado del pipeline de captura, para mostrarlo en la UI.
@@ -20,6 +21,7 @@ pub enum Status {
         info: CameraDescription,
         depth: StreamInfo,
         rgb: Option<StreamInfo>,
+        params: CloudParams,
     },
     Error(String),
     Stopped,
@@ -84,6 +86,12 @@ fn capture_loop<F>(
                 info: s.info.clone(),
                 depth: s.depth_info,
                 rgb: s.rgb_info,
+                params: CloudParams {
+                    depth_intr: s.depth_intr,
+                    rgb_intr: s.rgb_intr,
+                    extrinsics: s.extrinsics,
+                    depth_scale: s.depth_scale,
+                },
             });
             s
         }

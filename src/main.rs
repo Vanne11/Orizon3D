@@ -5,6 +5,7 @@
 
 mod app;
 mod capture;
+mod pointcloud;
 mod sdk;
 
 use app::RevoApp;
