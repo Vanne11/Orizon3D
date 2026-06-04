@@ -1,5 +1,6 @@
 //! Interfaz gráfica (egui/eframe): visor de streams + nube de puntos.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -8,7 +9,7 @@ use eframe::egui;
 use crate::capture::{Capture, DepthControls, Status};
 use crate::pointcloud::{self, CloudParams, OrbitCamera, PointCloud};
 use crate::scan::ScanSession;
-use crate::camera::{CameraDescription, Frames};
+use crate::camera::{CameraDescription, DepthFrame, Frames};
 
 /// Ajuste fino de calibración sobre los intrínsecos por FOV real. Persistente en
 /// `calibration.txt` para no recalibrar cada vez.
@@ -111,6 +112,12 @@ pub struct RevoApp {
     isolate_object: bool,
     /// Quita píxeles voladores en bordes de profundidad (halo objeto/fondo).
     edge_filter: bool,
+    /// Suavizado temporal: mediana por píxel de los últimos N mapas de
+    /// profundidad (baja el ruido del sensor en reposo).
+    temporal_smooth: bool,
+    temporal_n: usize,
+    /// Historial reciente de mapas de profundidad (para el suavizado temporal).
+    depth_history: VecDeque<Vec<u16>>,
 
     // Exposición/ganancia del sensor de profundidad.
     depth_auto_exposure: bool,
@@ -171,6 +178,9 @@ impl RevoApp {
             clean_noise: true,
             isolate_object: true,
             edge_filter: true,
+            temporal_smooth: true,
+            temporal_n: 3,
+            depth_history: VecDeque::new(),
             depth_auto_exposure: true,
             depth_exposure: 8000,
             depth_gain: 1,
@@ -254,6 +264,7 @@ impl RevoApp {
             latest = Some(f);
         }
         if let Some(frames) = latest {
+            self.push_depth_history(&frames.depth);
             self.update_depth(ctx, &frames);
             if let Some(rgb) = &frames.rgb {
                 self.update_rgb(ctx, rgb.width as usize, rgb.height as usize, &rgb.rgb);
@@ -267,6 +278,40 @@ impl RevoApp {
             self.cloud_dirty = true;
             self.tick_fps();
         }
+    }
+
+    /// Mantiene el historial de los últimos `temporal_n` mapas de profundidad.
+    /// Si cambia la resolución, vacía el historial para no mezclar tamaños.
+    fn push_depth_history(&mut self, depth: &DepthFrame) {
+        let n = self.temporal_n.max(1);
+        if let Some(last) = self.depth_history.back() {
+            if last.len() != depth.depth.len() {
+                self.depth_history.clear();
+            }
+        }
+        self.depth_history.push_back(depth.depth.clone());
+        while self.depth_history.len() > n {
+            self.depth_history.pop_front();
+        }
+    }
+
+    /// Profundidad efectiva para generar la nube: la mediana temporal de los
+    /// últimos frames si el suavizado está activo y hay historial suficiente;
+    /// si no, `None` (el llamador usa el mapa original sin copiarlo).
+    fn smoothed_depth(&self, depth: &DepthFrame) -> Option<Vec<u16>> {
+        if !self.temporal_smooth || self.temporal_n < 2 || self.depth_history.len() < 2 {
+            return None;
+        }
+        let maps: Vec<&[u16]> = self.depth_history.iter().map(|v| v.as_slice()).collect();
+        // Un píxel sobrevive si es válido en al menos la mitad de los frames:
+        // así se elimina el parpadeo de bordes inestables.
+        let min_valid = (maps.len() / 2).max(1);
+        Some(pointcloud::temporal_median(
+            &maps,
+            depth.width as usize,
+            depth.height as usize,
+            min_valid,
+        ))
     }
 
     /// Calcula distancia media (cm) y cobertura (fracción de píxeles válidos)
@@ -338,7 +383,20 @@ impl RevoApp {
     /// objeto, no en ruido ni fondo.
     fn integrate_scan_frame(&mut self, frames: &Frames) {
         let Some(params) = self.effective_params() else { return };
-        let cloud = PointCloud::generate(&frames.depth, frames.rgb.as_ref(), &params);
+        let smoothed = self.smoothed_depth(&frames.depth);
+        let tmp;
+        let depth = if let Some(d) = smoothed {
+            tmp = DepthFrame {
+                width: frames.depth.width,
+                height: frames.depth.height,
+                depth: d,
+                timestamp_ms: frames.depth.timestamp_ms,
+            };
+            &tmp
+        } else {
+            &frames.depth
+        };
+        let cloud = PointCloud::generate(depth, frames.rgb.as_ref(), &params);
         let cloud = if self.clean_noise || self.isolate_object {
             let min_pts = if self.clean_noise { 3 } else { 1 };
             crate::scan::clean_cloud(&cloud, 3.0, min_pts, self.isolate_object)
@@ -457,7 +515,20 @@ impl RevoApp {
                 self.cloud_dirty = false;
                 return;
             };
-            PointCloud::generate(&frames.depth, frames.rgb.as_ref(), &params)
+            let smoothed = self.smoothed_depth(&frames.depth);
+            let tmp;
+            let depth = if let Some(d) = smoothed {
+                tmp = DepthFrame {
+                    width: frames.depth.width,
+                    height: frames.depth.height,
+                    depth: d,
+                    timestamp_ms: frames.depth.timestamp_ms,
+                };
+                &tmp
+            } else {
+                &frames.depth
+            };
+            PointCloud::generate(depth, frames.rgb.as_ref(), &params)
         };
 
         // Limpieza/detección del objeto: quita ruido y aísla el grupo principal.
@@ -763,6 +834,22 @@ impl RevoApp {
         changed |= ui
             .checkbox(&mut self.edge_filter, "Limpiar bordes (quitar píxeles voladores)")
             .changed();
+        changed |= ui
+            .checkbox(&mut self.temporal_smooth, "Suavizado temporal (menos ruido en reposo)")
+            .changed();
+        if self.temporal_smooth {
+            changed |= ui
+                .add(egui::Slider::new(&mut self.temporal_n, 2..=7).text("frames a promediar"))
+                .changed();
+            ui.label(
+                egui::RichText::new(
+                    "Promedia los últimos N frames: alisa la superficie quieta, pero \
+                     si mueves rápido la cámara puede emborronar. Baja N si notas arrastre.",
+                )
+                .small()
+                .color(egui::Color32::from_gray(160)),
+            );
+        }
 
         if changed {
             self.cloud_dirty = true;

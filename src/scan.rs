@@ -819,14 +819,28 @@ fn smallest_eigvec_sym3(mut a: [[f64; 3]; 3]) -> [f32; 3] {
 // Fusión incremental por rejilla de vóxeles.
 // ---------------------------------------------------------------------------
 
+/// Peso de confianza por punto ≈ 1/z² (z = profundidad en coords de cámara, mm).
+/// En un sensor de luz estructurada el ruido crece con la distancia, así que las
+/// lecturas cercanas son más fiables y deben pesar más al fusionar. Devuelve 0
+/// para profundidades no válidas (descarta el punto en la fusión).
+fn confidence_weights(points: &[Point]) -> Vec<f32> {
+    points
+        .iter()
+        .map(|p| if p.z > 1.0 { 1.0 / (p.z * p.z) } else { 0.0 })
+        .collect()
+}
+
 struct Accum {
     pos: [f64; 3],
     col: [f64; 3],
+    w: f64,
     n: u32,
 }
 
-/// Acumulador de puntos por vóxel: cada celda guarda el promedio de posición y
-/// color de todas las observaciones que han caído en ella.
+/// Acumulador de puntos por vóxel: cada celda guarda el promedio PONDERADO de
+/// posición y color de todas las observaciones que han caído en ella. El peso
+/// es la "confianza" de cada lectura (≈1/z²): las muestras cercanas, menos
+/// ruidosas en un sensor de luz estructurada, pesan más que las lejanas.
 pub struct FusionGrid {
     voxel: f32,
     cells: HashMap<Cell, Accum>,
@@ -842,26 +856,34 @@ impl FusionGrid {
         }
     }
 
-    /// Integra puntos ya expresados en coordenadas globales.
-    pub fn integrate(&mut self, points: &[Point], has_color: bool) {
+    /// Integra puntos ya expresados en coordenadas globales, con un peso de
+    /// confianza por punto (`weights[i]`). Si `weights` es más corto que
+    /// `points`, los puntos sin peso usan 1.0 (sin ponderar).
+    pub fn integrate(&mut self, points: &[Point], weights: &[f32], has_color: bool) {
         if has_color {
             self.has_color = true;
         }
-        for p in points {
+        for (i, p) in points.iter().enumerate() {
+            let w = weights.get(i).copied().unwrap_or(1.0).max(0.0) as f64;
+            if w <= 0.0 {
+                continue;
+            }
             let e = self
                 .cells
                 .entry(cell_of([p.x, p.y, p.z], self.voxel))
                 .or_insert(Accum {
                     pos: [0.0; 3],
                     col: [0.0; 3],
+                    w: 0.0,
                     n: 0,
                 });
-            e.pos[0] += p.x as f64;
-            e.pos[1] += p.y as f64;
-            e.pos[2] += p.z as f64;
-            e.col[0] += p.rgb[0] as f64;
-            e.col[1] += p.rgb[1] as f64;
-            e.col[2] += p.rgb[2] as f64;
+            e.pos[0] += w * p.x as f64;
+            e.pos[1] += w * p.y as f64;
+            e.pos[2] += w * p.z as f64;
+            e.col[0] += w * p.rgb[0] as f64;
+            e.col[1] += w * p.rgb[1] as f64;
+            e.col[2] += w * p.rgb[2] as f64;
+            e.w += w;
             e.n += 1;
         }
     }
@@ -879,15 +901,16 @@ impl FusionGrid {
     pub fn to_cloud(&self) -> PointCloud {
         let mut points = Vec::with_capacity(self.cells.len());
         for a in self.cells.values() {
-            let n = a.n as f64;
+            // Promedio ponderado por confianza (peso total acumulado).
+            let w = if a.w > 0.0 { a.w } else { a.n.max(1) as f64 };
             points.push(Point {
-                x: (a.pos[0] / n) as f32,
-                y: (a.pos[1] / n) as f32,
-                z: (a.pos[2] / n) as f32,
+                x: (a.pos[0] / w) as f32,
+                y: (a.pos[1] / w) as f32,
+                z: (a.pos[2] / w) as f32,
                 rgb: [
-                    (a.col[0] / n) as u8,
-                    (a.col[1] / n) as u8,
-                    (a.col[2] / n) as u8,
+                    (a.col[0] / w) as u8,
+                    (a.col[1] / w) as u8,
+                    (a.col[2] / w) as u8,
                 ],
             });
         }
@@ -982,7 +1005,8 @@ impl ScanSession {
         if self.model.is_empty() {
             // Primer frame: define el sistema de coordenadas global.
             self.pose = Transform::identity();
-            self.fusion.integrate(&cloud.points, cloud.has_color);
+            let weights = confidence_weights(&cloud.points);
+            self.fusion.integrate(&cloud.points, &weights, cloud.has_color);
             self.rebuild_model();
             self.stats.registered += 1;
             self.stats.last_corr = self.model.len();
@@ -1015,7 +1039,10 @@ impl ScanSession {
         }
         self.pose = res.transform;
 
-        // Transformar la nube completa a coords globales y fusionar.
+        // Transformar la nube completa a coords globales y fusionar. El peso de
+        // confianza se calcula con la profundidad en coords de CÁMARA (antes de
+        // transformar), alineado por índice con `global`.
+        let weights = confidence_weights(&cloud.points);
         let mut global: Vec<Point> = Vec::with_capacity(cloud.points.len());
         for p in &cloud.points {
             let g = self.pose.apply([p.x, p.y, p.z]);
@@ -1026,7 +1053,7 @@ impl ScanSession {
                 rgb: p.rgb,
             });
         }
-        self.fusion.integrate(&global, cloud.has_color);
+        self.fusion.integrate(&global, &weights, cloud.has_color);
 
         // Actualizar el modelo acumulado para el siguiente ICP.
         self.rebuild_model();
@@ -1210,11 +1237,24 @@ mod tests {
     fn fusion_merges_repeated_observations() {
         let mut grid = FusionGrid::new(2.0);
         // Tres observaciones del mismo punto (misma celda) → un solo vóxel.
-        grid.integrate(&pts(&[[0.1, 0.1, 0.1], [0.2, 0.0, 0.3], [0.0, 0.2, 0.1]]), false);
-        grid.integrate(&pts(&[[100.0, 100.0, 100.0]]), false);
+        grid.integrate(&pts(&[[0.1, 0.1, 0.1], [0.2, 0.0, 0.3], [0.0, 0.2, 0.1]]), &[], false);
+        grid.integrate(&pts(&[[100.0, 100.0, 100.0]]), &[], false);
         assert_eq!(grid.len(), 2);
         let cloud = grid.to_cloud();
         assert_eq!(cloud.points.len(), 2);
+    }
+
+    #[test]
+    fn fusion_weights_pull_toward_confident() {
+        // Dos observaciones en la misma celda con distinta confianza: el
+        // promedio ponderado se acerca a la de mayor peso.
+        let mut grid = FusionGrid::new(100.0); // celda grande → mismo vóxel
+        grid.integrate(&pts(&[[0.0, 0.0, 0.0]]), &[3.0], false);
+        grid.integrate(&pts(&[[10.0, 0.0, 0.0]]), &[1.0], false);
+        let c = grid.to_cloud();
+        assert_eq!(c.points.len(), 1);
+        // (3·0 + 1·10) / (3+1) = 2.5
+        assert!((c.points[0].x - 2.5).abs() < 1e-4, "x={}", c.points[0].x);
     }
 
     #[test]

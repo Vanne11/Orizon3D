@@ -253,6 +253,37 @@ pub fn filter_flying_pixels(
     out
 }
 
+/// Mediana temporal por píxel sobre los últimos mapas de profundidad (todos del
+/// mismo tamaño). Reduce el ruido del sensor IR promediando en el TIEMPO el
+/// mismo punto de vista —distinto de la fusión por ÁNGULOS del escaneo—, lo que
+/// estabiliza la superficie sin tener que mover la cámara. Un píxel solo
+/// sobrevive si tiene al menos `min_valid` lecturas válidas (≠0), de modo que
+/// además se descartan los píxeles que parpadean en los bordes.
+pub fn temporal_median(maps: &[&[u16]], width: usize, height: usize, min_valid: usize) -> Vec<u16> {
+    let n = width * height;
+    let mut out = vec![0u16; n];
+    if maps.is_empty() {
+        return out;
+    }
+    let min_valid = min_valid.max(1);
+    let mut vals: Vec<u16> = Vec::with_capacity(maps.len());
+    for i in 0..n {
+        vals.clear();
+        for m in maps {
+            if let Some(&d) = m.get(i) {
+                if d != 0 {
+                    vals.push(d);
+                }
+            }
+        }
+        if vals.len() >= min_valid {
+            vals.sort_unstable();
+            out[i] = vals[vals.len() / 2];
+        }
+    }
+    out
+}
+
 /// Proyecta un punto de profundidad al frame RGB y devuelve su color.
 /// Replica la transformación de `generatePoint` del SDK.
 fn sample_color(
@@ -512,6 +543,20 @@ mod tests {
         // Orla del escalón eliminada (a ambos lados de la discontinuidad).
         assert_eq!(at(3, 4), 0, "borde izq del escalón debe quitarse");
         assert_eq!(at(4, 4), 0, "borde der del escalón debe quitarse");
+    }
+
+    #[test]
+    fn temporal_median_reduces_noise_and_drops_flicker() {
+        // 3 píxeles, 3 frames. P0 ruidoso [100,108,104] → mediana 104.
+        // P1 válido en 1 solo frame → con min_valid=2 se elimina. P2 siempre 0.
+        let f0 = [100u16, 200, 0];
+        let f1 = [108u16, 0, 0];
+        let f2 = [104u16, 0, 0];
+        let maps: Vec<&[u16]> = vec![&f0, &f1, &f2];
+        let out = temporal_median(&maps, 3, 1, 2);
+        assert_eq!(out[0], 104, "mediana del píxel ruidoso");
+        assert_eq!(out[1], 0, "píxel que parpadea (1/3) se descarta");
+        assert_eq!(out[2], 0);
     }
 
     #[test]
