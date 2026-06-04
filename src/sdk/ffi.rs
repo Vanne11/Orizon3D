@@ -151,3 +151,24 @@ extern "C" {
     pub fn frameGetHeight(frame: *const CFrame) -> c_int;
     pub fn frameGetFormat(frame: *const CFrame) -> STREAM_FORMAT;
 }
+
+// --- Funciones de configuración del SDK (C++ en namespace `cs`) ---------
+//
+// Estas NO están en la C API de `h/`, sino en `hpp/System.hpp`, así que sus
+// símbolos están "mangled". Las enlazamos por su nombre mangled exacto (sacado
+// con `nm -D lib3DCamera.so`). Sirven para activar el log interno del SDK
+// (clave para diagnosticar fallos de conexión) y forzar el backend libuvc.
+#[link(name = "3DCamera")]
+extern "C" {
+    /// `cs::setLogSavePath(const char*)` — ruta del fichero de log del SDK.
+    #[link_name = "_ZN2cs14setLogSavePathEPKc"]
+    pub fn setLogSavePath(path: *const c_char);
+
+    /// `cs::enableLoging(bool)` — activa/desactiva el log interno (sic, "Loging").
+    #[link_name = "_ZN2cs12enableLogingEb"]
+    pub fn enableLoging(enable: bool);
+
+    /// `cs::setSdkEnableLibuvc(bool)` — fuerza el backend libuvc/libusb del SDK.
+    #[link_name = "_ZN2cs18setSdkEnableLibuvcEb"]
+    pub fn setSdkEnableLibuvc(enable: bool);
+}

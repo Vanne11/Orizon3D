@@ -1,12 +1,12 @@
 [package]
-name = "revoscan-linux"
+name = "orizon3d"
 version = "0.1.0"
 edition = "2021"
-description = "Aplicación de escaneo 3D para escáneres Revopoint (POP 2 / POP 3) en Linux"
+description = "Orizon3D — aplicación de escaneo 3D para escáneres Revopoint (POP 2 / POP 3) en Linux"
 license = "GPL-3.0"
 
 [[bin]]
-name = "revoscan"
+name = "orizon3d"
 path = "src/main.rs"
 
 [dependencies]
@@ -17,6 +17,9 @@ log = "0.4"
 env_logger = "0.11"
 # Decodificador JPEG en Rust puro para el stream RGB en formato MJPG.
 zune-jpeg = "0.4"
+# Captura V4L2 directa del escáner (UVC), sin el SDK propietario (que exige
+# licencia). Usa ioctls V4L2 crudos, no necesita libv4l.
+v4l = "0.14"
 
 [profile.release]
 opt-level = 3

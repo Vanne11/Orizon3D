@@ -6,7 +6,9 @@
 
 pub mod ffi;
 
+use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
+use std::path::PathBuf;
 use std::ptr;
 
 /// Error genérico del SDK.
@@ -80,46 +82,109 @@ pub struct Session {
 }
 
 impl Session {
+    /// Ruta del log interno del SDK. Lo activamos para poder diagnosticar
+    /// fallos de conexión (el SDK escribe ahí el error real de libusb).
+    pub fn sdk_log_path() -> PathBuf {
+        PathBuf::from("captures").join("sdk.log")
+    }
+
+    /// Configura el log del SDK. El SDK ya escribe sus trazas por stdout, así
+    /// que el log a fichero es OPCIONAL: solo se activa con `REVOSCAN_SDK_LOG=1`.
+    ///
+    /// Importante: el SDK RETIENE el puntero de la ruta y lo usa/libera más
+    /// tarde (durante connect), así que la cadena debe vivir para siempre; la
+    /// fugamos a propósito con `into_raw()`. Pasar un `CString` temporal aquí
+    /// provoca un «double free» al conectar.
+    unsafe fn configure_sdk() {
+        if std::env::var_os("REVOSCAN_SDK_LOG").is_none() {
+            return;
+        }
+        let _ = std::fs::create_dir_all("captures");
+        if let Ok(path) = CString::new(Self::sdk_log_path().to_string_lossy().as_bytes()) {
+            ffi::setLogSavePath(path.into_raw()); // fuga intencionada: el SDK lo retiene
+            ffi::enableLoging(true);
+        }
+    }
+
     /// Crea el sistema, enumera escáneres, conecta el primero y arranca el
     /// stream de profundidad (y el RGB si está disponible).
     pub fn open() -> Result<Session> {
         unsafe {
+            Self::configure_sdk();
             let sys = ffi::createSystem();
             if sys.is_null() {
                 return Err(SdkError("createSystem() devolvió NULL".into()));
             }
 
-            // 1) Enumerar cámaras conectadas.
-            let mut count: c_int = 0;
-            let list = ffi::systemCreateCameraInfoList(sys, &mut count);
-            if list.is_null() || count <= 0 {
-                if !list.is_null() {
+            // 1) Esperar a que la enumeración (asíncrona, vía el hilo de sondeo
+            //    libuvc del SDK) registre una cámara con un serial válido. Si
+            //    conectamos demasiado pronto, la instancia interna aún no existe
+            //    y connect falla. Sondeamos hasta ~6 s.
+            let mut chosen: Option<ffi::CameraInfo> = None;
+            for _ in 0..30 {
+                let mut count: c_int = 0;
+                let list = ffi::systemCreateCameraInfoList(sys, &mut count);
+                if !list.is_null() && count > 0 {
+                    let infos = std::slice::from_raw_parts(list, count as usize);
+                    // Preferimos una con serial no vacío (detección completa);
+                    // si aún no lo hay, guardamos la primera como reserva.
+                    let pick = infos
+                        .iter()
+                        .find(|c| !cstr_to_string(&c.serial).trim().is_empty())
+                        .copied()
+                        .unwrap_or(infos[0]);
+                    let has_serial = !cstr_to_string(&pick.serial).trim().is_empty();
+                    chosen = Some(pick);
+                    ffi::systemDeleteCameraInfoList(list);
+                    if has_serial {
+                        break;
+                    }
+                } else if !list.is_null() {
                     ffi::systemDeleteCameraInfoList(list);
                 }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+
+            let Some(mut chosen) = chosen else {
                 ffi::deleteSystem(sys);
                 return Err(SdkError(
                     "No se detectó ningún escáner Revopoint. \
                      Conéctalo por USB y revisa las reglas udev (ver README)."
                         .into(),
                 ));
-            }
+            };
 
-            // 2) Tomar la primera cámara de la lista.
-            let infos = std::slice::from_raw_parts(list, count as usize);
-            let mut chosen = infos[0];
             let info = CameraDescription {
                 name: cstr_to_string(&chosen.name),
                 serial: cstr_to_string(&chosen.serial),
                 firmware: cstr_to_string(&chosen.firmware_version),
             };
 
-            let camera = ffi::systemConnectCamera(sys, &mut chosen);
-            ffi::systemDeleteCameraInfoList(list);
+            // 2) Conectar, con algún reintento por si la instancia tarda un poco
+            //    más en quedar lista tras aparecer el serial.
+            let mut camera: *mut ffi::CCamera = ptr::null_mut();
+            for attempt in 0..4 {
+                camera = ffi::systemConnectCamera(sys, &mut chosen);
+                if !camera.is_null() {
+                    log::info!(
+                        "Conectado a «{}» (serial {}) en el intento {}",
+                        info.name,
+                        info.serial,
+                        attempt + 1
+                    );
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
             if camera.is_null() {
                 ffi::deleteSystem(sys);
                 return Err(SdkError(format!(
-                    "No se pudo conectar con la cámara «{}»",
-                    info.name
+                    "Se detectó la cámara «{}» (serial {}) pero no se pudo conectar \
+                     tras varios intentos. Trazas del SDK por consola; o ejecuta con \
+                     REVOSCAN_SDK_LOG=1 (→ {}).",
+                    info.name,
+                    info.serial,
+                    Self::sdk_log_path().display()
                 )));
             }
 

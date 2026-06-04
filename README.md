@@ -1,80 +1,100 @@
-# RevoScan Linux
+# Orizon3D
 
-Aplicación de escaneo 3D para escáneres **Revopoint POP 2 / POP 3** en Linux,
-escrita en **Rust**. Revopoint no publica RevoScan para Linux, pero sí publica
-el SDK de cámara `lib3DCamera` (que sí funciona en Linux). Este proyecto
-construye, paso a paso, la aplicación que falta sobre ese SDK.
+Aplicación de escaneo 3D para escáneres **Revopoint POP 2 / POP 3** en **Linux**,
+escrita en **Rust**. Revopoint no publica su software de escaneo para Linux, así
+que Orizon3D lo reconstruye desde cero: captura, visor, nube de puntos, registro
+multi-frame y mallado, todo nativo.
+
+La captura usa **V4L2 directamente** (el escáner es un dispositivo UVC estándar:
+profundidad `Y16` + color `MJPG`), sin depender del SDK propietario ni de
+licencias. La GUI es **egui/eframe** y el visor 3D es un rasterizador por software
+(sin dependencias gráficas extra).
 
 ## Estado
 
-**Paso 1 — Conectar y ver el stream ✅**
-- Detecta el escáner por USB mediante el SDK oficial (`lib3DCamera.so`, FFI).
-- Conecta con la primera cámara disponible.
-- Arranca el stream de profundidad y lo muestra en vivo (mapa de color
-  azul→rojo) en una ventana egui, con FPS e info de la cámara (nombre, S/N, FW).
+- [x] **Streams** — profundidad (mapa de color) y color (RGB) en vivo, con FPS.
+- [x] **Nube de puntos** — deproyección por frame, color emparejado, export **PLY**.
+- [x] **Escaneo multi-frame** — registro por ICP punto-a-plano + fusión por vóxeles.
+- [x] **Malla** — reconstrucción por campo de distancia con signo (MLS) + Surface
+      Nets, suavizado y simplificación, export **OBJ / STL / PLY**.
+- [x] **Controles** — exposición/ganancia, volumen de escaneo (caja), detección y
+      aislamiento del objeto, calibración fina (FOV + escala de profundidad).
 
-### Hoja de ruta
-- [x] **Paso 1**: conectar + ver stream de profundidad
-- [ ] **Paso 2**: stream RGB emparejado (`getPairedFrame`, decodificar MJPG/H264)
-- [ ] **Paso 3**: nube de puntos por frame + exportar PLY (intrínsecos del SDK)
-- [ ] **Paso 4**: registro/alineado de frames (ICP) y fusión
-- [ ] **Paso 5**: malla + texturizado + exportar OBJ/STL
-- [ ] Controles: exposición, ganancia, HDR, modo disparo, rango de profundidad
+Ver [`ROADMAP.md`](ROADMAP.md) para lo que sigue.
 
 ## Arquitectura
 
 ```
 src/
-  main.rs       Punto de entrada + ventana eframe
-  app.rs        GUI egui: visor, colormap de profundidad, estado/FPS
-  capture.rs    Hilo de captura (posee la sesión del SDK) ↔ canales a la GUI
-  sdk/
-    ffi.rs      Bindings FFI crudos contra lib3DCamera (extern "C")
-    mod.rs      Envoltura segura (RAII): Session = sistema → cámara → stream
-vendor/3DCamera/
-  lib/lib3DCamera.so   SDK oficial de Revopoint (Linux x64)
-  include/             Headers C/C++ del SDK (referencia)
-  cs_uvc.rules         Reglas udev para acceso USB
-scripts/install-udev.sh
+  main.rs        Punto de entrada + ventana eframe
+  app.rs         GUI egui: visores, controles, escaneo, malla, calibración
+  camera.rs      Descubrimiento V4L2 + tipos de frame + decodificación (Y16/MJPG)
+  capture.rs     Hilo de captura V4L2 ↔ canales a la GUI (exposición/ganancia)
+  pointcloud.rs  Deproyección a nube, color, export PLY y visor por software
+  scan.rs        ICP punto-a-plano, normales, fusión por vóxeles (escaneo)
+  mesh.rs        Reconstrucción de malla (MLS + Surface Nets), export OBJ/STL/PLY
+scripts/
+  install-udev.sh   Reglas udev de acceso USB (V4L2)
+  fetch-sdk.sh      (Opcional) baja el SDK propietario, solo de referencia
+vendor/3DCamera/    SDK oficial de Revopoint — LEGADO/REFERENCIA (no se usa para
+src/sdk/            compilar; la captura va por V4L2). Se conserva por si en el
+                    futuro se explora la vía con licencia.
 ```
 
-El driver de cámara habla **UVC sobre libusb** directamente (no usa el módulo
-`uvcvideo` del kernel), por eso solo hace falta dar permiso de usuario al nodo
-USB vía udev. El patrón de captura (callback NULL + polling con `getFrame`)
-replica el que usa el visor oficial de Revopoint (`3DViewer`).
+La captura va por `uvcvideo` (V4L2): el kernel debe tener el módulo cargado para
+que aparezcan los nodos `/dev/video*`; solo hace falta permiso de usuario sobre
+ellos (lo dan las reglas udev o el grupo `video`).
 
 ## Requisitos
 
-- Linux x86-64, Rust (cargo) y un toolchain de C para enlazar.
-- Dependencias de sistema de egui/eframe (X11 o Wayland, OpenGL).
+- Linux x86-64, **Rust** (cargo) y un compilador de C para enlazar.
+- Dependencias de sistema de egui/eframe (X11 o Wayland, OpenGL) y `v4l`.
 
-## Instalación y uso
+## Uso
 
-1. Descarga la librería oficial del SDK (~94 MB, no versionada en el repo):
+### Rápido: `./orizon3d.sh`
 
-   ```sh
-   ./scripts/fetch-sdk.sh
-   ```
+Script en la raíz que cubre el ciclo de desarrollo. Sin argumentos abre un menú
+interactivo; también acepta comandos directos:
 
-2. Instala las reglas udev (una sola vez) y reconecta el escáner:
+```sh
+./orizon3d.sh setup    # dependencias de sistema + compila (release)
+./orizon3d.sh udev     # instala reglas udev de acceso USB (usa sudo, una vez)
+./orizon3d.sh start    # ejecuta la versión release
+./orizon3d.sh run      # ejecuta en debug
+./orizon3d.sh build    # compila release
+./orizon3d.sh test     # tests unitarios
+./orizon3d.sh check    # fmt + clippy + tests (estilo CI)
+./orizon3d.sh doctor   # diagnostica entorno y detecta el escáner
+./orizon3d.sh status   # versiones, rama y commit
+./orizon3d.sh help     # lista completa de comandos
+```
 
-   ```sh
-   sudo ./scripts/install-udev.sh
-   ```
+### Manual
 
-3. Compila y ejecuta:
+```sh
+sudo ./scripts/install-udev.sh   # acceso USB (una vez); reconecta el escáner
+cargo run --release
+```
 
-   ```sh
-   cargo run --release
-   ```
+Con el escáner conectado verás el stream de profundidad en vivo. Sin escáner, la
+app abre igual y muestra el motivo en la barra de estado; usa **⟳ Reconectar**
+tras enchufarlo.
 
-Con el escáner conectado verás el stream de profundidad en vivo. Sin escáner,
-la app abre igualmente y muestra el motivo en la barra de estado; usa
-**⟳ Reconectar** tras enchufarlo.
+## Solución de problemas
 
-## Notas
+- **No detecta el escáner**: comprueba que `uvcvideo` está cargado y que aparecen
+  los nodos (`ls /dev/video*`), y que tienes permiso de lectura sobre ellos
+  (instala las reglas udev o añade tu usuario al grupo `video` y reinicia sesión).
+  `./orizon3d.sh doctor` lo revisa por ti.
+- **`rustup could not choose a version of cargo to run … no default is configured`**:
+  ocurre con varios `rustup` instalados (p. ej. el de `pacman` en
+  `/usr/lib/rustup/bin` y el de rustup.rs en `~/.cargo/bin`). Soluciónalo con
+  `rustup default stable`.
 
-- El binario embebe un `RUNPATH` a `vendor/3DCamera/lib`, así que no necesitas
-  `LD_LIBRARY_PATH`.
-- `lib3DCamera.so` es un binario propietario de Revopoint redistribuido desde su
-  repositorio open-source [`Revopoint/3DViewer`](https://github.com/Revopoint/3DViewer) (GPL-3.0).
+## Licencia
+
+GPL-3.0. El SDK propietario `lib3DCamera.so` (legado, no necesario para compilar)
+se redistribuye desde el repositorio open-source de Revopoint
+[`Revopoint/3DViewer`](https://github.com/Revopoint/3DViewer) y se baja aparte con
+`./scripts/fetch-sdk.sh`.

@@ -9,8 +9,15 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-use crate::sdk::ffi::{Extrinsics, Intrinsics};
-use crate::sdk::{DepthFrame, RgbFrame};
+use crate::camera::{DepthFrame, Extrinsics, Intrinsics, RgbFrame};
+
+/// Caja delimitadora (región de interés) en coordenadas de cámara/mundo (mm).
+/// Solo se conservan los puntos dentro de la caja: aísla el objeto del entorno.
+#[derive(Debug, Clone, Copy)]
+pub struct Roi {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
 
 /// Parámetros de calibración necesarios para generar la nube.
 #[derive(Debug, Clone, Copy)]
@@ -19,6 +26,12 @@ pub struct CloudParams {
     pub rgb_intr: Option<Intrinsics>,
     pub extrinsics: Extrinsics,
     pub depth_scale: f32,
+    /// Recorte de profundidad (mm) para descartar fondo/ruido fuera del volumen
+    /// de trabajo. `0` = sin límite.
+    pub clip_min_mm: f32,
+    pub clip_max_mm: f32,
+    /// Caja delimitadora 3D opcional (recorta también a los lados).
+    pub roi: Option<Roi>,
 }
 
 /// Un punto 3D con color opcional.
@@ -75,11 +88,43 @@ impl PointCloud {
                 if z <= 0.0 {
                     continue;
                 }
+                // Recorte por volumen de trabajo (descarta fondo/ruido).
+                if p.clip_min_mm > 0.0 && z < p.clip_min_mm {
+                    continue;
+                }
+                if p.clip_max_mm > 0.0 && z > p.clip_max_mm {
+                    continue;
+                }
                 let x = (u as f32 - cx) * z / fx;
-                let y = (v as f32 - cy) * z / fy;
+                // `y_img` sigue la convención de imagen (v hacia abajo); el mundo
+                // usa Y hacia arriba, así que invertimos para que el objeto no
+                // salga «de cabeza». El color se muestrea con `y_img` (frame de
+                // cámara real).
+                let y_img = (v as f32 - cy) * z / fy;
+                let y = -y_img;
+
+                // Caja delimitadora: descarta lo que quede fuera (también lados).
+                if let Some(r) = &p.roi {
+                    if x < r.min[0]
+                        || x > r.max[0]
+                        || y < r.min[1]
+                        || y > r.max[1]
+                        || z < r.min[2]
+                        || z > r.max[2]
+                    {
+                        continue;
+                    }
+                }
 
                 let color = if want_color {
-                    sample_color(x, y, z, rgb.unwrap(), p.rgb_intr.as_ref().unwrap(), &p.extrinsics)
+                    sample_color(
+                        x,
+                        y_img,
+                        z,
+                        rgb.unwrap(),
+                        p.rgb_intr.as_ref().unwrap(),
+                        &p.extrinsics,
+                    )
                 } else {
                     // Sin color real: gris según el valor para que se vea algo.
                     [200, 200, 200]
@@ -102,7 +147,7 @@ impl PointCloud {
 
         writeln!(out, "ply")?;
         writeln!(out, "format ascii 1.0")?;
-        writeln!(out, "comment generado por RevoScan Linux")?;
+        writeln!(out, "comment generado por Orizon3D")?;
         writeln!(out, "element vertex {}", self.points.len())?;
         writeln!(out, "property float x")?;
         writeln!(out, "property float y")?;
@@ -188,7 +233,13 @@ impl Default for OrbitCamera {
 
 /// Rasteriza la nube a un buffer RGB de tamaño (w,h) con z-buffer.
 /// Devuelve los píxeles en orden RGB entrelazado.
-pub fn render(cloud: &PointCloud, cam: OrbitCamera, w: usize, h: usize) -> Vec<u8> {
+pub fn render(
+    cloud: &PointCloud,
+    cam: OrbitCamera,
+    w: usize,
+    h: usize,
+    tint: Option<[f32; 3]>,
+) -> Vec<u8> {
     let mut pixels = vec![15u8; w * h * 3]; // fondo gris oscuro
     let mut zbuf = vec![f32::INFINITY; w * h];
     if cloud.points.is_empty() || w == 0 || h == 0 {
@@ -245,9 +296,17 @@ pub fn render(cloud: &PointCloud, cam: OrbitCamera, w: usize, h: usize) -> Vec<u
         if zc < zbuf[idx] {
             zbuf[idx] = zc;
             let o = idx * 3;
-            pixels[o] = p.rgb[0];
-            pixels[o + 1] = p.rgb[1];
-            pixels[o + 2] = p.rgb[2];
+            let rgb = match tint {
+                Some(t) => [
+                    (p.rgb[0] as f32 * t[0]).min(255.0) as u8,
+                    (p.rgb[1] as f32 * t[1]).min(255.0) as u8,
+                    (p.rgb[2] as f32 * t[2]).min(255.0) as u8,
+                ],
+                None => p.rgb,
+            };
+            pixels[o] = rgb[0];
+            pixels[o + 1] = rgb[1];
+            pixels[o + 2] = rgb[2];
         }
     }
 
@@ -257,7 +316,7 @@ pub fn render(cloud: &PointCloud, cam: OrbitCamera, w: usize, h: usize) -> Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sdk::DepthFrame;
+    use crate::camera::DepthFrame;
 
     fn intr(w: i16, h: i16, fx: f32, fy: f32, cx: f32, cy: f32) -> Intrinsics {
         Intrinsics {
@@ -288,6 +347,9 @@ mod tests {
             rgb_intr: None,
             extrinsics: Extrinsics::default(),
             depth_scale: 0.1,
+            clip_min_mm: 0.0,
+            clip_max_mm: 0.0,
+            roi: None,
         };
         let cloud = PointCloud::generate(&frame, None, &params);
         assert_eq!(cloud.points.len(), 1);
@@ -315,6 +377,9 @@ mod tests {
             rgb_intr: None,
             extrinsics: Extrinsics::default(),
             depth_scale: 0.1,
+            clip_min_mm: 0.0,
+            clip_max_mm: 0.0,
+            roi: None,
         };
         // Escala 0.5: fx'=50, cx'=1. u=2 → x=(2-1)*5/50=0.1; v=1 → y=(1-1)*5/50=0.
         let cloud = PointCloud::generate(&frame, None, &params);
@@ -338,6 +403,9 @@ mod tests {
             rgb_intr: None,
             extrinsics: Extrinsics::default(),
             depth_scale: 0.1,
+            clip_min_mm: 0.0,
+            clip_max_mm: 0.0,
+            roi: None,
         };
         let cloud = PointCloud::generate(&frame, None, &params);
         assert!(cloud.points.is_empty());
