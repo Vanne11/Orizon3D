@@ -1,0 +1,18 @@
+# Artefactos de compilación
+/target
+
+# Lockfile: SÍ se versiona (esto es una app/binario), así que NO se ignora.
+
+# SDK propietario (legado, no necesario para compilar): el .so (~94 MB) se baja
+# con scripts/fetch-sdk.sh
+/vendor/3DCamera/lib/lib3DCamera.so
+
+# Material de referencia voluminoso (no forma parte del producto)
+/reference-3DViewer
+
+# Datos locales del usuario
+/captures
+/calibration.txt
+
+# Ajustes locales de Claude Code (por máquina)
+/.claude/settings.local.json
