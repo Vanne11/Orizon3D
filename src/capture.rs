@@ -218,6 +218,7 @@ fn capture_loop<F>(
         clip_min_mm: 0.0,
         clip_max_mm: 0.0,
         roi: None,
+        edge_filter: true,
     };
     let _ = status_tx.send(Status::Streaming {
         info: found.info.clone(),

@@ -109,6 +109,8 @@ pub struct RevoApp {
     // Detección/limpieza del objeto.
     clean_noise: bool,
     isolate_object: bool,
+    /// Quita píxeles voladores en bordes de profundidad (halo objeto/fondo).
+    edge_filter: bool,
 
     // Exposición/ganancia del sensor de profundidad.
     depth_auto_exposure: bool,
@@ -155,15 +157,20 @@ impl RevoApp {
             coverage: 0.0,
             last_track_ok: true,
             calib: Calib::load(),
-            clip_min: 100.0,
-            clip_max: 1000.0,
+            // Volumen ajustado a un objeto cercano (~15–35 cm): corta la pared/
+            // fondo más allá de ~45 cm y limita los lados a una ventana de 30 cm,
+            // de modo que el objeto sea el grupo conexo mayor y se aísle solo.
+            // Se puede ampliar con los sliders de "Volumen de escaneo".
+            clip_min: 120.0,
+            clip_max: 450.0,
             box_lateral: true,
             box_cx: 0.0,
             box_cy: 0.0,
-            box_sx: 500.0,
-            box_sy: 500.0,
+            box_sx: 300.0,
+            box_sy: 300.0,
             clean_noise: true,
             isolate_object: true,
+            edge_filter: true,
             depth_auto_exposure: true,
             depth_exposure: 8000,
             depth_gain: 1,
@@ -373,6 +380,7 @@ impl RevoApp {
             min: [xmin, ymin, self.clip_min.max(0.0)],
             max: [xmax, ymax, self.clip_max.max(0.0)],
         });
+        p.edge_filter = self.edge_filter;
         Some(p)
     }
 
@@ -752,6 +760,9 @@ impl RevoApp {
         changed |= ui
             .checkbox(&mut self.isolate_object, "Aislar objeto principal (mayor grupo)")
             .changed();
+        changed |= ui
+            .checkbox(&mut self.edge_filter, "Limpiar bordes (quitar píxeles voladores)")
+            .changed();
 
         if changed {
             self.cloud_dirty = true;
@@ -769,20 +780,28 @@ impl RevoApp {
         }
     }
 
-    /// Controles de exposición/ganancia del sensor de profundidad.
+    /// Controles del sensor de profundidad. El sensor IR de la POP solo admite
+    /// AUTO-exposición por V4L2 (no expone exposición manual: el control queda
+    /// `inactive`), así que la única palanca real es la ganancia.
     fn exposure_ui(&mut self, ui: &mut egui::Ui) {
-        let mut changed = false;
-        changed |= ui
-            .checkbox(&mut self.depth_auto_exposure, "Exposición automática")
-            .changed();
-        if !self.depth_auto_exposure {
-            changed |= ui
-                .add(egui::Slider::new(&mut self.depth_exposure, 1..=30000).text("exposición"))
-                .changed();
-        }
-        changed |= ui
+        ui.label(
+            egui::RichText::new(
+                "El sensor de profundidad (IR) solo permite auto-exposición; no \
+                 expone exposición manual por V4L2. Única palanca: ganancia.",
+            )
+            .small()
+            .color(egui::Color32::from_gray(160)),
+        );
+        let changed = ui
             .add(egui::Slider::new(&mut self.depth_gain, 1..=16).text("ganancia"))
             .changed();
+        ui.label(
+            egui::RichText::new(
+                "Recomendado ≤3: más ganancia ilumina pero mete ruido y baja la precisión.",
+            )
+            .small()
+            .color(egui::Color32::from_gray(160)),
+        );
         if changed {
             self.push_depth_controls();
         }

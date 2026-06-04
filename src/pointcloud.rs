@@ -32,6 +32,9 @@ pub struct CloudParams {
     pub clip_max_mm: f32,
     /// Caja delimitadora 3D opcional (recorta también a los lados).
     pub roi: Option<Roi>,
+    /// Elimina "píxeles voladores" en los bordes de profundidad antes de
+    /// deproyectar (limpia el halo/estiramiento objeto↔fondo). `false` = off.
+    pub edge_filter: bool,
 }
 
 /// Un punto 3D con color opcional.
@@ -78,9 +81,25 @@ impl PointCloud {
         let want_color = rgb.is_some() && p.rgb_intr.is_some();
         let mut points = Vec::with_capacity((w * h) as usize / 2);
 
+        // Pre-filtro de bordes (píxeles voladores) sobre el mapa de profundidad.
+        let filtered;
+        let dmap: &[u16] = if p.edge_filter {
+            filtered = filter_flying_pixels(
+                &depth.depth,
+                w as usize,
+                h as usize,
+                p.depth_scale,
+                0.05,
+                8.0,
+            );
+            &filtered
+        } else {
+            &depth.depth
+        };
+
         for v in 0..h {
             for u in 0..w {
-                let d = depth.depth[(v * w + u) as usize];
+                let d = dmap[(v * w + u) as usize];
                 if d == 0 {
                     continue;
                 }
@@ -173,6 +192,65 @@ impl PointCloud {
         out.flush()?;
         Ok(())
     }
+}
+
+/// Elimina "píxeles voladores": muestras en discontinuidades de profundidad
+/// (bordes objeto/fondo) que el sensor de luz estructurada interpola y que
+/// generan halos y estiramientos alrededor del objeto. Pone a 0 (inválido)
+/// cualquier píxel cuyo mayor salto de profundidad respecto a sus 8 vecinos
+/// supere un umbral proporcional a la distancia (`rel`·z, con suelo `abs_mm`),
+/// o que tenga muy pocos vecinos válidos (mota aislada). No introduce datos
+/// nuevos: solo recorta una orla de ~1 px en los bordes, afinando la silueta.
+pub fn filter_flying_pixels(
+    depth: &[u16],
+    width: usize,
+    height: usize,
+    depth_scale: f32,
+    rel: f32,
+    abs_mm: f32,
+) -> Vec<u16> {
+    let mut out = depth.to_vec();
+    if width == 0 || height == 0 {
+        return out;
+    }
+    let (w, h) = (width as i32, height as i32);
+    for v in 0..h {
+        for u in 0..w {
+            let i = (v * w + u) as usize;
+            let d = depth[i];
+            if d == 0 {
+                continue;
+            }
+            let z = d as f32 * depth_scale;
+            let thresh = (rel * z).max(abs_mm);
+            let mut valid = 0u32;
+            let mut max_diff = 0.0f32;
+            for dv in -1..=1 {
+                for du in -1..=1 {
+                    if du == 0 && dv == 0 {
+                        continue;
+                    }
+                    let (uu, vv) = (u + du, v + dv);
+                    if uu < 0 || vv < 0 || uu >= w || vv >= h {
+                        continue;
+                    }
+                    let nd = depth[(vv * w + uu) as usize];
+                    if nd == 0 {
+                        continue;
+                    }
+                    valid += 1;
+                    let diff = (nd as f32 - d as f32).abs() * depth_scale;
+                    if diff > max_diff {
+                        max_diff = diff;
+                    }
+                }
+            }
+            if valid < 3 || max_diff > thresh {
+                out[i] = 0;
+            }
+        }
+    }
+    out
 }
 
 /// Proyecta un punto de profundidad al frame RGB y devuelve su color.
@@ -350,6 +428,7 @@ mod tests {
             clip_min_mm: 0.0,
             clip_max_mm: 0.0,
             roi: None,
+            edge_filter: false,
         };
         let cloud = PointCloud::generate(&frame, None, &params);
         assert_eq!(cloud.points.len(), 1);
@@ -380,6 +459,7 @@ mod tests {
             clip_min_mm: 0.0,
             clip_max_mm: 0.0,
             roi: None,
+            edge_filter: false,
         };
         // Escala 0.5: fx'=50, cx'=1. u=2 → x=(2-1)*5/50=0.1; v=1 → y=(1-1)*5/50=0.
         let cloud = PointCloud::generate(&frame, None, &params);
@@ -406,9 +486,32 @@ mod tests {
             clip_min_mm: 0.0,
             clip_max_mm: 0.0,
             roi: None,
+            edge_filter: false,
         };
         let cloud = PointCloud::generate(&frame, None, &params);
         assert!(cloud.points.is_empty());
+    }
+
+    #[test]
+    fn flying_pixels_trim_depth_step_keep_flat() {
+        // Dos planos a 100 mm y 200 mm con un escalón vertical en col 4.
+        // El filtro debe borrar la orla del escalón (cols 3 y 4) y conservar
+        // las zonas planas interiores.
+        let (w, h) = (8usize, 8usize);
+        let mut depth = vec![0u16; w * h];
+        for v in 0..h {
+            for u in 0..w {
+                depth[v * w + u] = if u < 4 { 1000 } else { 2000 };
+            }
+        }
+        let out = filter_flying_pixels(&depth, w, h, 0.1, 0.05, 8.0);
+        let at = |u: usize, v: usize| out[v * w + u];
+        // Interiores planos conservados.
+        assert_ne!(at(1, 4), 0, "plano izquierdo interior debe conservarse");
+        assert_ne!(at(6, 4), 0, "plano derecho interior debe conservarse");
+        // Orla del escalón eliminada (a ambos lados de la discontinuidad).
+        assert_eq!(at(3, 4), 0, "borde izq del escalón debe quitarse");
+        assert_eq!(at(4, 4), 0, "borde der del escalón debe quitarse");
     }
 
     #[test]

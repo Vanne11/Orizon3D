@@ -40,6 +40,17 @@ impl Transform {
             r[6] * p[0] + r[7] * p[1] + r[8] * p[2] + self.t[2],
         ]
     }
+
+    /// Aplica solo la rotación (para vectores/normales, sin traslación).
+    #[inline]
+    pub fn apply_vec(&self, v: [f32; 3]) -> [f32; 3] {
+        let r = &self.r;
+        [
+            r[0] * v[0] + r[1] * v[1] + r[2] * v[2],
+            r[3] * v[0] + r[4] * v[1] + r[5] * v[2],
+            r[6] * v[0] + r[7] * v[1] + r[8] * v[2],
+        ]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -553,30 +564,56 @@ pub fn icp_point_to_plane(
     let mut corr = 0;
     let mut iters = 0;
     const KEEP_FRAC: f32 = 0.8;
+    // Compatibilidad de normales: rechaza correspondencias entre superficies
+    // cuyas normales difieran más de ~60° (|cos| < 0.5). Empareja solo puntos
+    // de la misma cara, evitando que el frente case con un lateral —principal
+    // fuente de deriva al girar el objeto—. Se usa el valor absoluto porque las
+    // normales del modelo no están orientadas (PCA da signo arbitrario).
+    const NORMAL_COS_MIN: f32 = 0.5;
 
-    // (p_transformado, q_target, n_target, d2)
-    let mut pairs: Vec<([f32; 3], [f32; 3], [f32; 3], f32)> = Vec::with_capacity(src.len());
+    // Normales del src en su propio frame (se rotan con la pose en cada iter).
+    let src_normals = estimate_normals(src, max_dist);
+
+    // (p_transformado, q_target, n_target, b_residuo, d2)
+    let mut pairs: Vec<([f32; 3], [f32; 3], [f32; 3], f32, f32)> = Vec::with_capacity(src.len());
 
     for it in 0..max_iter {
         iters = it + 1;
         pairs.clear();
-        for &s in src {
+        for (i, &s) in src.iter().enumerate() {
             let p = t.apply(s);
             if let Some((idx, d2)) = target.nearest(p, max_dist) {
-                pairs.push((p, target.point(idx), normals[idx], d2));
+                let n = normals[idx];
+                // Normal del src rotada al frame global y comparada con la del target.
+                let ns = t.apply_vec(src_normals[i]);
+                let dot = ns[0] * n[0] + ns[1] * n[1] + ns[2] * n[2];
+                if dot.abs() < NORMAL_COS_MIN {
+                    continue;
+                }
+                let q = target.point(idx);
+                let b = (q[0] - p[0]) * n[0] + (q[1] - p[1]) * n[1] + (q[2] - p[2]) * n[2];
+                pairs.push((p, q, n, b, d2));
             }
         }
         if pairs.len() < min_corr {
             return None;
         }
-        pairs.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+        pairs.sort_by(|a, b| a.4.partial_cmp(&b.4).unwrap_or(std::cmp::Ordering::Equal));
         let keep = (((pairs.len() as f32 * KEEP_FRAC) as usize).max(min_corr)).min(pairs.len());
 
-        // Sistema normal 6×6: A^T A x = A^T b, con A_i = [p×n, n], b_i=(q-p)·n.
+        // Escala robusta: mediana del residuo absoluto |b| sobre las parejas
+        // conservadas → umbral de Huber δ = 1.345·σ (acotado para no anularse).
+        let mut absb: Vec<f32> = pairs[..keep].iter().map(|p| p.3.abs()).collect();
+        absb.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let sigma = absb[absb.len() / 2];
+        let delta = (1.345 * sigma).max(0.5); // mm
+
+        // Sistema normal 6×6 ponderado: A^T W A x = A^T W b, con
+        // A_i = [p×n, n], b_i=(q-p)·n, y peso de Huber w_i.
         let mut ata = [[0.0f64; 6]; 6];
         let mut atb = [0.0f64; 6];
         let mut sum_d2 = 0.0f64;
-        for &(p, q, n, d2) in &pairs[..keep] {
+        for &(p, _q, n, b, d2) in &pairs[..keep] {
             let c = [
                 p[1] * n[2] - p[2] * n[1],
                 p[2] * n[0] - p[0] * n[2],
@@ -590,12 +627,15 @@ pub fn icp_point_to_plane(
                 n[1] as f64,
                 n[2] as f64,
             ];
-            let b = ((q[0] - p[0]) * n[0] + (q[1] - p[1]) * n[1] + (q[2] - p[2]) * n[2]) as f64;
+            // Peso de Huber: 1 para residuos pequeños, δ/|b| para los grandes.
+            let ab = b.abs();
+            let w = if ab <= delta { 1.0 } else { (delta / ab) as f64 };
+            let b = b as f64;
             for r in 0..6 {
                 for cc in 0..6 {
-                    ata[r][cc] += row[r] * row[cc];
+                    ata[r][cc] += w * row[r] * row[cc];
                 }
-                atb[r] += row[r] * b;
+                atb[r] += w * row[r] * b;
             }
             sum_d2 += d2 as f64;
         }
@@ -1113,6 +1153,43 @@ mod tests {
         for k in 0..3 {
             assert!(
                 (res.transform.t[k] - shift[k]).abs() < 0.4,
+                "t[{k}]={} esperado≈{}",
+                res.transform.t[k],
+                shift[k]
+            );
+        }
+    }
+
+    #[test]
+    fn point_to_plane_robust_to_outliers() {
+        // Superficie curva con un ~16% de puntos atípicos (saltos en Z). El
+        // rechazo por normales + la ponderación de Huber deben recuperar el
+        // desplazamiento con la misma precisión que sin atípicos.
+        let mut base = Vec::new();
+        for i in 0..16 {
+            for j in 0..16 {
+                let x = i as f32 * 3.0;
+                let y = j as f32 * 3.0;
+                let z = 60.0 + 5.0 * ((i as f32 * 0.4).sin() + (j as f32 * 0.4).cos());
+                base.push([x, y, z]);
+            }
+        }
+        let normals = estimate_normals(&base, 10.0);
+        let target = VoxelIndex::build(base.clone(), 10.0);
+        let shift = [1.2f32, -0.8, 0.6];
+        let mut src: Vec<[f32; 3]> = base
+            .iter()
+            .map(|p| [p[0] - shift[0], p[1] - shift[1], p[2] - shift[2]])
+            .collect();
+        // Inyectar atípicos: empujar 1 de cada 6 puntos fuertemente en Z.
+        for k in (0..src.len()).step_by(6) {
+            src[k][2] += 7.0;
+        }
+        let res =
+            icp_point_to_plane(&src, &target, &normals, Transform::identity(), 60, 10.0, 10).unwrap();
+        for k in 0..3 {
+            assert!(
+                (res.transform.t[k] - shift[k]).abs() < 0.5,
                 "t[{k}]={} esperado≈{}",
                 res.transform.t[k],
                 shift[k]
