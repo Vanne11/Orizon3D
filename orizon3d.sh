@@ -33,6 +33,26 @@ ensure_cargo() {
     fi
 }
 
+# Componentes de rustup imprescindibles para 'check' (clippy + rustfmt).
+ensure_components() {
+    command -v rustup >/dev/null 2>&1 || return 0
+    local installed; installed="$(rustup component list --installed 2>/dev/null)"
+    for c in clippy rustfmt; do
+        if ! grep -q "^${c}" <<<"$installed"; then
+            info "Instalando componente rustup: $c…"
+            rustup component add "$c" || warn "No pude instalar $c"
+        fi
+    done
+}
+
+# Herramientas cargo opcionales para el flujo de desarrollo (hot-reload).
+ensure_dev_tools() {
+    if ! command -v cargo-watch >/dev/null 2>&1; then
+        info "Instalando cargo-watch (recarga en caliente)…"
+        cargo install cargo-watch || warn "cargo-watch no se instaló; 'dev' caerá a 'run'."
+    fi
+}
+
 detect_pm() {
     for pm in pacman apt-get dnf zypper; do
         command -v "$pm" >/dev/null 2>&1 && { echo "$pm"; return 0; }
@@ -46,17 +66,19 @@ install_system_deps() {
     [[ -z "$pm" ]] && { warn "Gestor de paquetes no reconocido; instala manualmente las deps de egui (X11/Wayland + OpenGL) y un compilador C."; return 0; }
     info "Instalando dependencias de sistema con $pm…"
     case "$pm" in
-        pacman)  sudo pacman -S --needed --noconfirm base-devel libxcb libxkbcommon libxkbcommon-x11 wayland mesa vulkan-icd-loader ;;
-        apt-get) sudo apt-get update && sudo apt-get install -y build-essential libxcb1-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev pkg-config ;;
-        dnf)     sudo dnf install -y @development-tools libxcb-devel libxkbcommon-devel wayland-devel mesa-libGL-devel pkgconf-pkg-config ;;
-        zypper)  sudo zypper install -y -t pattern devel_basis && sudo zypper install -y libxcb-devel libxkbcommon-devel wayland-devel Mesa-libGL-devel ;;
+        pacman)  sudo pacman -S --needed --noconfirm base-devel libxcb libxkbcommon libxkbcommon-x11 wayland mesa vulkan-icd-loader v4l-utils ;;
+        apt-get) sudo apt-get update && sudo apt-get install -y build-essential libxcb1-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev pkg-config v4l-utils ;;
+        dnf)     sudo dnf install -y @development-tools libxcb-devel libxkbcommon-devel wayland-devel mesa-libGL-devel pkgconf-pkg-config v4l-utils ;;
+        zypper)  sudo zypper install -y -t pattern devel_basis && sudo zypper install -y libxcb-devel libxkbcommon-devel wayland-devel Mesa-libGL-devel v4l-utils ;;
     esac || warn "Algunas dependencias no se instalaron; revísalo si la app no compila/arranca."
 }
 
 cmd_setup() {
-    header "Setup"
+    header "Setup (entorno de desarrollo completo)"
     install_system_deps
     ensure_cargo || return 1
+    ensure_components
+    ensure_dev_tools
     info "Compilando en release…"
     ( cd "$PROJECT_DIR" && cargo build --release ) && success "Listo. Ejecuta: ./orizon3d.sh udev && ./orizon3d.sh start"
 }
@@ -88,6 +110,19 @@ cmd_run() {
     ( cd "$PROJECT_DIR" && cargo run ) || true
 }
 
+# Desarrollo: recompila y relanza al guardar cambios (hot-reload con cargo-watch).
+cmd_dev() {
+    header "Dev (recarga en caliente)"
+    ensure_cargo || return 1
+    if command -v cargo-watch >/dev/null 2>&1; then
+        info "Vigilando src/ — guarda un archivo para recompilar y relanzar (Ctrl+C para salir)."
+        ( cd "$PROJECT_DIR" && cargo watch -x run )
+    else
+        warn "cargo-watch no instalado; ejecuto una vez en debug. Instálalo con: ./orizon3d.sh setup"
+        cmd_run
+    fi
+}
+
 cmd_test() {
     header "Tests"
     ensure_cargo || return 1
@@ -97,6 +132,7 @@ cmd_test() {
 cmd_check() {
     header "Check (fmt + clippy + tests)"
     ensure_cargo || return 1
+    ensure_components
     cd "$PROJECT_DIR"
     cargo fmt --all -- --check || warn "fmt: hay diferencias (corrige con: cargo fmt --all)"
     cargo clippy --all-targets -- -D warnings || warn "clippy: hay avisos"
@@ -113,6 +149,16 @@ cmd_doctor() {
     header "Doctor"
     echo -e "${BOLD}Rust:${NC}   $(cargo --version 2>/dev/null || echo 'N/A — instala Rust')"
     echo -e "${BOLD}rustc:${NC}  $(rustc --version 2>/dev/null || echo 'N/A')"
+    echo ""
+    # Herramientas de desarrollo
+    echo -e "${BOLD}Herramientas:${NC}"
+    for t in clippy rustfmt cargo-watch v4l2-ctl pkg-config cc; do
+        if command -v "$t" >/dev/null 2>&1 || rustup component list --installed 2>/dev/null | grep -q "^$t"; then
+            success "$t"
+        else
+            warn "$t no encontrado (./orizon3d.sh setup)"
+        fi
+    done
     echo ""
     # ¿uvcvideo cargado?
     if lsmod 2>/dev/null | grep -q '^uvcvideo'; then
@@ -152,10 +198,11 @@ cmd_help() {
     echo ""
     echo -e "${BOLD}Uso:${NC} ./orizon3d.sh [comando]      (sin comando = menú interactivo)"
     echo ""
-    echo "  setup     dependencias de sistema + compila (release)"
+    echo "  setup     deps de sistema + componentes + cargo-watch + compila (release)"
     echo "  udev      instala reglas udev de acceso USB (sudo, una vez)"
     echo "  start     ejecuta la versión release"
     echo "  run       ejecuta en debug"
+    echo "  dev       recompila y relanza al guardar (hot-reload)"
     echo "  build     compila release"
     echo "  test      tests unitarios"
     echo "  check     fmt + clippy + tests (estilo CI)"
@@ -171,19 +218,21 @@ menu_loop() {
         echo -e "${BOLD}${CYAN}Orizon3D${NC} ${DIM}· $(git -C "$PROJECT_DIR" branch --show-current 2>/dev/null || echo '-')${NC}\n"
         echo -e "  ${GREEN}1${NC}) start      ${DIM}ejecuta release${NC}"
         echo -e "  ${GREEN}2${NC}) run        ${DIM}ejecuta debug${NC}"
-        echo -e "  ${YELLOW}3${NC}) build      ${DIM}compila release${NC}"
-        echo -e "  ${YELLOW}4${NC}) test       ${DIM}tests${NC}"
-        echo -e "  ${YELLOW}5${NC}) check      ${DIM}fmt + clippy + tests${NC}"
-        echo -e "  ${BLUE}6${NC}) setup      ${DIM}deps + compila${NC}"
-        echo -e "  ${BLUE}7${NC}) udev       ${DIM}reglas USB${NC}"
-        echo -e "  ${BLUE}8${NC}) doctor     ${DIM}diagnóstico${NC}"
-        echo -e "  ${BLUE}9${NC}) status     ${DIM}info${NC}"
+        echo -e "  ${GREEN}3${NC}) dev        ${DIM}hot-reload (recompila al guardar)${NC}"
+        echo -e "  ${YELLOW}4${NC}) build      ${DIM}compila release${NC}"
+        echo -e "  ${YELLOW}5${NC}) test       ${DIM}tests${NC}"
+        echo -e "  ${YELLOW}6${NC}) check      ${DIM}fmt + clippy + tests${NC}"
+        echo -e "  ${BLUE}7${NC}) setup      ${DIM}deps + herramientas + compila${NC}"
+        echo -e "  ${BLUE}8${NC}) udev       ${DIM}reglas USB${NC}"
+        echo -e "  ${BLUE}9${NC}) doctor     ${DIM}diagnóstico${NC}"
+        echo -e "  ${BLUE}10${NC}) status    ${DIM}info${NC}"
         echo -e "  ${RED}0${NC}) salir\n"
         echo -ne "${BOLD}  Opción: ${NC}"; read -r c
         case "${c// /}" in
-            1) cmd_start ;; 2) cmd_run ;; 3) cmd_build ;; 4) cmd_test ;;
-            5) cmd_check ;; 6) cmd_setup ;; 7) cmd_udev ;; 8) cmd_doctor ;;
-            9) cmd_status ;; 0|q|exit|salir) echo -e "\n${GREEN}Hasta luego${NC}"; exit 0 ;;
+            1) cmd_start ;; 2) cmd_run ;; 3) cmd_dev ;; 4) cmd_build ;;
+            5) cmd_test ;; 6) cmd_check ;; 7) cmd_setup ;; 8) cmd_udev ;;
+            9) cmd_doctor ;; 10) cmd_status ;;
+            0|q|exit|salir) echo -e "\n${GREEN}Hasta luego${NC}"; exit 0 ;;
             "") ;; *) error "Opción inválida: $c"; sleep 1 ;;
         esac
         echo ""; echo -e "${DIM}ENTER para volver al menú…${NC}"; read -r
@@ -197,6 +246,7 @@ main() {
         udev)           cmd_udev ;;
         start)          shift; cmd_start "$@" ;;
         run)            cmd_run ;;
+        dev)            cmd_dev ;;
         build)          cmd_build ;;
         test)           cmd_test ;;
         check)          cmd_check ;;
