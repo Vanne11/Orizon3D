@@ -22,6 +22,24 @@ licencias. La GUI es **egui/eframe** y el visor 3D es un rasterizador por softwa
 
 Ver [`ROADMAP.md`](ROADMAP.md) para lo que sigue.
 
+## Stack
+
+Todo en **Rust**, sin motor 3D dedicado. Las dependencias (`Cargo.toml`):
+
+| Crate | Versión | Para qué |
+|-------|---------|----------|
+| `eframe` | 0.29 | Abre y gestiona la **ventana** del SO (bucle de eventos, contexto de render) |
+| `egui` | 0.29 | **GUI** immediate-mode: paneles, controles y visores dentro de la ventana |
+| `v4l` | 0.14 | Captura desde el escáner vía **V4L2** (profundidad `Y16` + color `MJPG`) |
+| `zune-jpeg` | 0.4 | Decodifica el stream `MJPG` del canal de color |
+| `crossbeam-channel` | 0.5 | Pasa frames entre el hilo de captura y el de la GUI |
+| `log` + `env_logger` | 0.4 / 0.11 | Logging |
+
+En resumen: `eframe` es la ventana real en Linux y `egui` es lo que se pinta
+adentro. El visor 3D de la nube de puntos / malla es un **rasterizador por
+software** propio (`pointcloud.rs`), sin `wgpu`, `bevy` ni dependencias gráficas
+extra.
+
 ## Arquitectura
 
 ```
